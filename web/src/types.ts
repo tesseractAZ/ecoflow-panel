@@ -298,3 +298,27 @@ export interface FleetDegradation {
   eolSoh: number;
   packs: PackDegradation[];
 }
+
+export interface CircuitDayTotal {
+  date: string;
+  dayStartMs: number;
+  dayEndMs: number;
+  isToday: boolean;
+  kwh: number;
+  peakW: number;
+  peakAtMs: number | null;
+  coverageMs: number;
+}
+
+export interface CircuitHistory {
+  sn: string;
+  ch: number;
+  days: CircuitDayTotal[];
+  summary: {
+    daysWithData: number;
+    totalKwh: number;
+    avgKwh: number;
+    peakDay: CircuitDayTotal | null;
+    minDay: CircuitDayTotal | null;
+  };
+}

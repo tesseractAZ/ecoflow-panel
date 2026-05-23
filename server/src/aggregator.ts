@@ -91,6 +91,111 @@ export function startOfLocalDayMs(d: Date = new Date()): number {
   return x.getTime();
 }
 
+/* ─── Per-circuit kWh history ──────────────────────────────────────────── */
+
+export interface CircuitDayTotal {
+  /** Local YYYY-MM-DD (avoid UTC-shift surprises). */
+  date: string;
+  dayStartMs: number;
+  /** Next local midnight, or `now` for the in-progress day. */
+  dayEndMs: number;
+  isToday: boolean;
+  kwh: number;
+  peakW: number;
+  /** epoch ms of the peak, or null if no samples. */
+  peakAtMs: number | null;
+  /** ms of the day where we actually had data (vs gap). */
+  coverageMs: number;
+}
+
+export interface CircuitHistory {
+  sn: string;
+  ch: number;
+  days: CircuitDayTotal[]; // oldest → newest
+  summary: {
+    daysWithData: number;
+    totalKwh: number;
+    avgKwh: number;
+    peakDay: CircuitDayTotal | null;
+    minDay: CircuitDayTotal | null;
+  };
+}
+
+const localDateStr = (ms: number): string => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+/**
+ * Per-day kWh totals (trapezoidal, gap-aware) for one SHP2 circuit over the
+ * last `days` calendar days, including the in-progress today as a partial /
+ * running-total entry. Capped server-side; callers in `index.ts` clamp `days`.
+ */
+export function circuitHistoryByDay(
+  recorder: Recorder,
+  sn: string,
+  ch: number,
+  days: number,
+): CircuitHistory {
+  const out: CircuitDayTotal[] = [];
+  const now = Date.now();
+  const todayStart = startOfLocalDayMs();
+  const ONE_DAY = 86_400_000;
+
+  for (let i = days - 1; i >= 0; i--) {
+    const dayStart = todayStart - i * ONE_DAY;
+    const dayEndFull = dayStart + ONE_DAY;
+    const dayEnd = i === 0 ? now : dayEndFull;
+    const pts = recorder.query(sn, `ch${ch}_w`, dayStart, dayEnd);
+    const integ = integrateWh(pts, dayStart, dayEnd);
+    let peakW = 0;
+    let peakAtMs: number | null = null;
+    for (const p of pts) {
+      if (p.value > peakW) {
+        peakW = p.value;
+        peakAtMs = p.ts;
+      }
+    }
+    out.push({
+      date: localDateStr(dayStart),
+      dayStartMs: dayStart,
+      dayEndMs: dayEnd,
+      isToday: i === 0,
+      kwh: Math.round((integ.wh / 1000) * 1000) / 1000,
+      peakW: Math.round(peakW),
+      peakAtMs,
+      coverageMs: integ.coverageMs,
+    });
+  }
+
+  const withData = out.filter((d) => d.coverageMs > 0);
+  const peakDay = withData.reduce<CircuitDayTotal | null>(
+    (b, d) => (b == null || d.kwh > b.kwh ? d : b),
+    null,
+  );
+  const minDay = withData.reduce<CircuitDayTotal | null>(
+    (b, d) => (b == null || d.kwh < b.kwh ? d : b),
+    null,
+  );
+  const totalKwh = withData.reduce((s, d) => s + d.kwh, 0);
+
+  return {
+    sn,
+    ch,
+    days: out,
+    summary: {
+      daysWithData: withData.length,
+      totalKwh: Math.round(totalKwh * 1000) / 1000,
+      avgKwh:
+        withData.length === 0
+          ? 0
+          : Math.round((totalKwh / withData.length) * 1000) / 1000,
+      peakDay,
+      minDay,
+    },
+  };
+}
+
 export function computeTotals(
   store: SnapshotStore,
   recorder: Recorder,
