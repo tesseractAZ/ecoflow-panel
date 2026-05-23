@@ -10,7 +10,7 @@ import { SnapshotStore, startPollLoop } from './snapshot.js';
 import type { DeviceSnapshot } from './snapshot.js';
 import { startMqtt } from './ecoflow/mqtt.js';
 import { createRecorder } from './recorder.js';
-import { computeTotals, startOfLocalDayMs } from './aggregator.js';
+import { computeTotals, startOfLocalDayMs, circuitHistoryByDay } from './aggregator.js';
 import { startAlertMonitor } from './alertMonitor.js';
 import { isConfigured } from './notify.js';
 import { getDayForecast, computeDegradation } from './analytics.js';
@@ -73,6 +73,29 @@ app.get<{ Querystring: { since?: string; until?: string } }>('/api/summary/today
   const until = req.query.until ? Number(req.query.until) : Date.now();
   return computeTotals(store, recorder, since, until);
 });
+
+/**
+ * Per-circuit daily kWh history for the CircuitModal's multi-day comparison.
+ * Returns the last `days` (default 7, max 30) of trapezoidal kWh + peak watt +
+ * peak timestamp + coverage, plus a summary block (avg, peak day, min day).
+ */
+app.get<{ Querystring: { sn?: string; ch?: string; days?: string } }>(
+  '/api/circuit/history',
+  async (req, reply) => {
+    const { sn, ch, days } = req.query;
+    if (!sn || !ch) {
+      reply.code(400);
+      return { error: 'sn and ch required' };
+    }
+    const chNum = Number(ch);
+    if (!Number.isInteger(chNum) || chNum < 1) {
+      reply.code(400);
+      return { error: 'ch must be a positive integer' };
+    }
+    const daysNum = Math.max(1, Math.min(30, Number(days ?? 7) || 7));
+    return circuitHistoryByDay(recorder, sn, chNum, daysNum);
+  },
+);
 
 app.get<{ Querystring: { sn?: string } }>('/api/debug/raw', async (req, reply) => {
   const sn = req.query.sn;

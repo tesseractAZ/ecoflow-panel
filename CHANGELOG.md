@@ -3,6 +3,29 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.4.0 — 2026-05-23
+
+### Features
+
+- **Per-circuit multi-day kWh comparison on the circuit modal.** Click
+  any SHP2 circuit on the Dashboard → in addition to the live "now",
+  "peak (24h)", "average (24h)", "today" tiles and the 24h watt chart,
+  there's a new **Last 7 days** panel: a bar chart of daily kWh totals
+  for the past week, with **today highlighted in accent** as a partial /
+  running total, the **peak day color-coded amber**, days with no data
+  rendered dim, and a **dashed reference line at the 7-day average**.
+  Hovering any bar shows that day's total kWh, peak watts, when the
+  peak hit, and a "partial day" caveat for incomplete windows. Three
+  summary tiles below the chart: average per day (with "N/7 days w/
+  data" coverage note), peak day, and quietest day.
+
+- **New `/api/circuit/history?sn=<SN>&ch=<N>&days=<N>` endpoint.**
+  Returns per-day trapezoidal kWh + peak watts + peak timestamp +
+  coverage, plus a summary block (average, peak day, min day). Day
+  windows are local-midnight to next local-midnight (or `now` for the
+  in-progress day). Days capped at 30 to keep recorder queries bounded;
+  default is 7.
+
 ## 0.3.1 — 2026-05-23
 
 Patch fix for the telnet TUI over `homeassistant.local`.
