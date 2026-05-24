@@ -292,6 +292,50 @@ rest:
         device_class: energy
         icon: mdi:transmission-tower
 
+      # ─── v0.7.6 HA Energy Dashboard — monotonic lifetime counters ─────────
+      # These five sensors use `state_class: total_increasing`, which is what
+      # HA's Energy Dashboard requires. Pick these (NOT the *_kwh_7d sensors)
+      # when wiring the Energy Dashboard up.
+      - name: "EcoFlow PV Production"
+        unique_id: ecoflow_pv_lifetime_kwh
+        value_template: "{{ value_json.pv_lifetime_kwh }}"
+        unit_of_measurement: "kWh"
+        state_class: total_increasing
+        device_class: energy
+        icon: mdi:solar-power
+
+      - name: "EcoFlow Home Consumption"
+        unique_id: ecoflow_load_lifetime_kwh
+        value_template: "{{ value_json.load_lifetime_kwh }}"
+        unit_of_measurement: "kWh"
+        state_class: total_increasing
+        device_class: energy
+        icon: mdi:home-lightning-bolt
+
+      - name: "EcoFlow Grid Import (lifetime)"
+        unique_id: ecoflow_grid_import_lifetime_kwh
+        value_template: "{{ value_json.grid_import_lifetime_kwh }}"
+        unit_of_measurement: "kWh"
+        state_class: total_increasing
+        device_class: energy
+        icon: mdi:transmission-tower-import
+
+      - name: "EcoFlow Battery Energy In"
+        unique_id: ecoflow_battery_charge_lifetime_kwh
+        value_template: "{{ value_json.battery_charge_lifetime_kwh }}"
+        unit_of_measurement: "kWh"
+        state_class: total_increasing
+        device_class: energy
+        icon: mdi:battery-charging
+
+      - name: "EcoFlow Battery Energy Out"
+        unique_id: ecoflow_battery_discharge_lifetime_kwh
+        value_template: "{{ value_json.battery_discharge_lifetime_kwh }}"
+        unit_of_measurement: "kWh"
+        state_class: total_increasing
+        device_class: energy
+        icon: mdi:battery-arrow-down
+
     binary_sensor:
       - name: "EcoFlow Off-Grid"
         unique_id: ecoflow_off_grid
@@ -299,6 +343,40 @@ rest:
         device_class: connectivity
         icon: mdi:transmission-tower-off
 ```
+
+### HA Energy Dashboard (v0.7.6)
+
+The five `state_class: total_increasing` sensors above feed straight into
+Home Assistant's built-in **Energy Dashboard**. Once they're created,
+go to **Settings → Dashboards → Energy** and wire them in:
+
+- **Electricity grid → Add consumption** → `sensor.ecoflow_grid_import_lifetime_kwh`
+- **Solar panels → Add solar production** → `sensor.ecoflow_pv_production`
+- **Home battery storage → Add battery system** →
+  - *Energy going IN to the battery* → `sensor.ecoflow_battery_energy_in`
+  - *Energy coming OUT of the battery* → `sensor.ecoflow_battery_energy_out`
+- (Optional) **Individual devices** → `sensor.ecoflow_home_consumption`
+  if you want the SHP2 panel-load total to appear as an "Other" device.
+
+How the counters survive add-on restarts and pruning:
+
+- Watt-integrated metrics (PV / load / grid) use a **persistent watermark**:
+  the add-on integrates `(watermark, now]` every 5 min into a `lifetime_totals`
+  table inside `/data/ecoflow.db`, then advances the watermark. The 30-day
+  retention on the raw `samples` table doesn't touch this accumulator.
+- Battery in / out come directly from the **BMS lifetime mAh counters**
+  (`accuChgMah` / `accuDsgMah`) converted to kWh at the 102.4 V nominal —
+  authoritative since pack manufacture, not affected by recorder downtime.
+- On every server boot the counters seed from the persisted floor so a
+  process restart can never regress the kWh number HA sees (which would
+  otherwise be interpreted as a reset).
+- If you **wipe `/data/ecoflow.db`** the counters legitimately restart from
+  zero; HA's `state_class: total_increasing` handles that as a reset and
+  begins a new accumulator forward — your historical Energy Dashboard
+  totals before the wipe are preserved.
+
+If you use MQTT Discovery (set `MQTT_DISCOVERY_ENABLED: true`), all five
+sensors auto-register and the YAML snippet isn't needed.
 
 ### Example automations
 

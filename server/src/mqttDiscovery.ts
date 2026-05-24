@@ -34,7 +34,7 @@ const DEVICE_INFO = {
   name: 'EcoFlow Panel',
   model: 'SHP2 + Delta Pro Ultra fleet dashboard',
   manufacturer: 'EcoFlow Panel (add-on)',
-  sw_version: '0.7.5',
+  sw_version: '0.7.6',
 };
 
 const STATE_TOPIC = 'ecoflow_panel/state';
@@ -85,6 +85,14 @@ const SENSORS: SensorConfig[] = [
   { unique_id: 'ecoflow_learned_warning_count', name: 'EcoFlow Learned Warnings', state_class: 'measurement', icon: 'mdi:lightbulb-on', value_template: '{{ value_json.learned_warning_count }}' },
   // Fleet
   { unique_id: 'ecoflow_fleet_devices_online', name: 'EcoFlow Fleet Devices Online', state_class: 'measurement', icon: 'mdi:home-battery', value_template: '{{ value_json.fleet_devices_online }}' },
+  // ─── HA Energy Dashboard — monotonic lifetime counters (v0.7.6) ──────────
+  // state_class: total_increasing tells HA to treat decreases as resets and
+  // accumulate the per-hour delta into long-term Energy statistics.
+  { unique_id: 'ecoflow_pv_lifetime_kwh', name: 'EcoFlow PV Production', device_class: 'energy', state_class: 'total_increasing', unit_of_measurement: 'kWh', icon: 'mdi:solar-power', value_template: '{{ value_json.pv_lifetime_kwh }}' },
+  { unique_id: 'ecoflow_load_lifetime_kwh', name: 'EcoFlow Home Consumption', device_class: 'energy', state_class: 'total_increasing', unit_of_measurement: 'kWh', icon: 'mdi:home-lightning-bolt', value_template: '{{ value_json.load_lifetime_kwh }}' },
+  { unique_id: 'ecoflow_grid_import_lifetime_kwh', name: 'EcoFlow Grid Import', device_class: 'energy', state_class: 'total_increasing', unit_of_measurement: 'kWh', icon: 'mdi:transmission-tower-import', value_template: '{{ value_json.grid_import_lifetime_kwh }}' },
+  { unique_id: 'ecoflow_battery_charge_lifetime_kwh', name: 'EcoFlow Battery Energy In', device_class: 'energy', state_class: 'total_increasing', unit_of_measurement: 'kWh', icon: 'mdi:battery-charging', value_template: '{{ value_json.battery_charge_lifetime_kwh }}' },
+  { unique_id: 'ecoflow_battery_discharge_lifetime_kwh', name: 'EcoFlow Battery Energy Out', device_class: 'energy', state_class: 'total_increasing', unit_of_measurement: 'kWh', icon: 'mdi:battery-arrow-down', value_template: '{{ value_json.battery_discharge_lifetime_kwh }}' },
 ];
 
 const BINARY_SENSORS = [
@@ -185,6 +193,9 @@ export async function startMqttDiscovery(
     const rte = computeRoundTripEfficiency(snap.devices, recorder);
     const clipping = await computeClipping(snap.devices, recorder, fc);
     const sc = computeSelfConsumption(snap.devices, recorder);
+    const lifetime = recorder.getLifetimeTotals();
+    const lifetimeKwh = (k: keyof typeof lifetime) =>
+      Math.round(((lifetime[k].persistedWh + lifetime[k].pendingWh) / 1000) * 1000) / 1000;
 
     const projecting = deg.packs.filter((p) => p.status === 'projecting');
     const soonest = projecting.reduce<typeof projecting[number] | null>(
@@ -217,6 +228,11 @@ export async function startMqttDiscovery(
       pv_array_peak_watts: clipping.arrayPeakW,
       solar_fraction_of_load_percent: sc.solarFractionOfLoadPct,
       direct_use_ratio_percent: sc.directUseRatioPct,
+      pv_lifetime_kwh: lifetimeKwh('fleet_pv_wh'),
+      load_lifetime_kwh: lifetimeKwh('fleet_load_wh'),
+      grid_import_lifetime_kwh: lifetimeKwh('fleet_grid_import_wh'),
+      battery_charge_lifetime_kwh: lifetimeKwh('fleet_battery_charge_wh'),
+      battery_discharge_lifetime_kwh: lifetimeKwh('fleet_battery_discharge_wh'),
       alert_critical_count: cnt('threshold', 'critical'),
       alert_warning_count: cnt('threshold', 'warning'),
       learned_warning_count: cnt('learned', 'warning'),

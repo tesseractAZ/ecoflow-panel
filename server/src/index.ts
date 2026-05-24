@@ -173,6 +173,26 @@ app.get('/api/clipping', async () => {
   return computeClipping(store.get().devices, recorder, fc);
 });
 
+// v0.7.6 — lifetime energy counters for HA Energy Dashboard.
+// Each entry: { persistedWh, pendingWh, watermarkMs } — live total = persistedWh + pendingWh.
+// HA expects monotonically-increasing kWh with state_class=total_increasing.
+app.get('/api/lifetime-energy', async () => {
+  const totals = recorder.getLifetimeTotals();
+  // Convert to kWh and expose both raw + summed views.
+  const toKwh = (wh: number) => Math.round((wh / 1000) * 1000) / 1000;
+  const live = (k: keyof typeof totals) =>
+    toKwh(totals[k].persistedWh + totals[k].pendingWh);
+  return {
+    generated_at: Date.now(),
+    pv_lifetime_kwh: live('fleet_pv_wh'),
+    load_lifetime_kwh: live('fleet_load_wh'),
+    grid_import_lifetime_kwh: live('fleet_grid_import_wh'),
+    battery_charge_lifetime_kwh: live('fleet_battery_charge_wh'),
+    battery_discharge_lifetime_kwh: live('fleet_battery_discharge_wh'),
+    details: totals,
+  };
+});
+
 // v0.7.5 — new analytics endpoints
 app.get<{ Querystring: { days?: string } }>('/api/self-consumption', async (req) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
@@ -262,6 +282,9 @@ app.get('/api/ha-state', async () => {
   const rte = computeRoundTripEfficiency(snap.devices, recorder);
   const clipping = await computeClipping(snap.devices, recorder, fc);
   const selfCons = computeSelfConsumption(snap.devices, recorder);
+  const lifetime = recorder.getLifetimeTotals();
+  const lifetimeKwh = (k: keyof typeof lifetime) =>
+    Math.round(((lifetime[k].persistedWh + lifetime[k].pendingWh) / 1000) * 1000) / 1000;
 
   // Soonest projected EOL = the pack with the fewest years left.
   const projecting = deg.packs.filter((p) => p.status === 'projecting');
@@ -358,6 +381,15 @@ app.get('/api/ha-state', async () => {
     grid_import_kwh_7d: selfCons.gridImportKwh,
     solar_fraction_of_load_percent: selfCons.solarFractionOfLoadPct,
     direct_use_ratio_percent: selfCons.directUseRatioPct,
+
+    // Lifetime monotonic energy counters for HA Energy Dashboard (v0.7.6).
+    // state_class: total_increasing — survive samples-table pruning via the
+    // persistent `lifetime_totals` table; battery counters come from the BMS.
+    pv_lifetime_kwh: lifetimeKwh('fleet_pv_wh'),
+    load_lifetime_kwh: lifetimeKwh('fleet_load_wh'),
+    grid_import_lifetime_kwh: lifetimeKwh('fleet_grid_import_wh'),
+    battery_charge_lifetime_kwh: lifetimeKwh('fleet_battery_charge_wh'),
+    battery_discharge_lifetime_kwh: lifetimeKwh('fleet_battery_discharge_wh'),
 
     // Connectivity
     fleet_devices_total: devices.length,
