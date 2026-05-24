@@ -3,6 +3,65 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.7.6 — 2026-05-24
+
+Patch + feature — full **Home Assistant Energy Dashboard** integration.
+
+### Features
+
+- **Persistent lifetime energy counters.** New `lifetime_totals` table
+  inside `/data/ecoflow.db` accumulates integrated Wh per metric under a
+  watermark — every 5 min we integrate `(watermark, now]` from the
+  rolling 30-day `samples` table, add the result to the persisted Wh,
+  then advance the watermark. Pruning of raw samples can't decrement the
+  counter; a server restart can't decrement it (boot seeds the floor
+  from the persisted row); a transient negative sample can't decrement
+  it (clamped at zero). Five counters maintained:
+  - `fleet_pv_wh` — sum of every DPU's `pv_total` watts integrated over time
+  - `fleet_load_wh` — SHP2 `panel_load` watts integrated
+  - `fleet_grid_import_wh` — sum of grid-tied DPUs' `ac_in` watts integrated
+  - `fleet_battery_charge_wh` — sourced directly from the **BMS
+    `accuChgMah` lifetime counters** across all packs, converted to Wh
+    at 102.4 V nominal. Authoritative since pack manufacture.
+  - `fleet_battery_discharge_wh` — same from `accuDsgMah`.
+- **HA Energy Dashboard wiring.** Five new sensors with
+  `state_class: total_increasing` + `device_class: energy` so Home
+  Assistant can ingest them into the Energy Dashboard's hourly /
+  daily / monthly statistics: PV Production, Home Consumption, Grid
+  Import (lifetime), Battery Energy In, Battery Energy Out.
+
+### API
+
+- **`/api/lifetime-energy`** — returns the five lifetime kWh values
+  plus a `details` block exposing `persistedWh` + `pendingWh` +
+  `watermarkMs` per metric (useful for diagnosing the rollup).
+- **`/api/ha-state`** gains 5 new lifetime kWh fields:
+  `pv_lifetime_kwh`, `load_lifetime_kwh`, `grid_import_lifetime_kwh`,
+  `battery_charge_lifetime_kwh`, `battery_discharge_lifetime_kwh`.
+
+### MQTT Discovery
+
+- 5 additional auto-discovered sensors when
+  `MQTT_DISCOVERY_ENABLED=1` is set — the Energy Dashboard slots fill
+  themselves with no YAML edits.
+
+### Docs
+
+- New **HA Energy Dashboard** subsection in `DOCS.md` walks through
+  the Settings → Dashboards → Energy hookup (one sensor per slot)
+  and documents the persistence design + reset semantics.
+
+### Notes
+
+- The recorder's existing 30-day retention on raw samples is
+  unchanged — `lifetime_totals` is a separate, lightweight, never-
+  pruned table (one row per metric).
+- On first install, the watermark seeds 60 s before boot so the
+  initial rollup doesn't try to integrate years of empty history;
+  numbers grow from there as live data arrives.
+- The `close()` shutdown path now does a final rollup before closing
+  the DB so we don't lose the trailing minute of energy.
+
 ## 0.7.5 — 2026-05-24
 
 The "drain the roadmap" release. Every remaining roadmap item from
