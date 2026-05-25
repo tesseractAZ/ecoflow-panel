@@ -77,8 +77,8 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
     -- don't surprise resource-constrained hosts.
     PRAGMA mmap_size = 268435456;
     -- temp_store: in-memory for temp B-trees used by GROUP BY (our new
-    -- SQL-side bucketing query relies on these). Default `0` is "file"
-    -- on some platforms.
+    -- SQL-side bucketing query relies on these). The default (0) maps
+    -- to "file" on some platforms - explicit MEMORY is faster + safer.
     PRAGMA temp_store = MEMORY;
     CREATE TABLE IF NOT EXISTS samples (
       ts INTEGER NOT NULL,

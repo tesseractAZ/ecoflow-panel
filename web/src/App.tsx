@@ -11,9 +11,13 @@ import { SmallDeviceCard } from './cards/SmallDeviceCard';
 import { alertCounts } from './alerts';
 import { sortDevices } from './sort';
 import { fmtRel } from './format';
-import { SERIES_PALETTE } from './theme';
+import { SERIES_PALETTE, useTheme } from './theme';
 import { ThemeToggle } from './components/ThemeToggle';
 import { installGlossaryTooltips } from './glossary';
+// v0.9.14 — Starfleet interface is rendered by a wholly separate
+// component tree (not a re-skin of these tabs). Lazy-loaded so it
+// doesn't ship in the Default/B5 bundle.
+const StarfleetBridge = lazy(() => import('./starfleet/StarfleetBridge').then((m) => ({ default: m.StarfleetBridge })));
 
 // v0.8.1 — route-level code splitting. Each non-default page becomes its own
 // chunk; recharts (~300 kB minified) is vendor-chunked separately via the
@@ -36,6 +40,18 @@ const PageFallback = () => (
 );
 
 export default function App() {
+  // v0.9.14 — the Starfleet theme uses a wholly separate UI tree. If the
+  // user has selected it, render the bridge and bail before touching any
+  // of the existing tab/page state. Default + B5 share this tree.
+  const [theme] = useTheme();
+  if (theme === 'starfleet') {
+    return (
+      <Suspense fallback={<PageFallback />}>
+        <StarfleetBridge />
+      </Suspense>
+    );
+  }
+
   const { snapshot, conn } = useSnapshot();
   const devices = snapshot ? Object.values(snapshot.devices) : [];
   const [showHistory, setShowHistory] = useState(false);
