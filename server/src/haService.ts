@@ -102,3 +102,24 @@ export async function getEntityState(entityId: string): Promise<{ state: string;
 export async function entityExists(entityId: string): Promise<boolean> {
   return (await getEntityState(entityId)) !== null;
 }
+
+/**
+ * v0.9.19 — fetch all entity states. Used by the broadcast-discovery
+ * endpoint to enumerate every media_player HA knows about, so the
+ * user can pick targets from a real list instead of guessing entity IDs.
+ */
+export async function getAllStates(): Promise<Array<{ entity_id: string; state: string; attributes: Record<string, unknown> }> | null> {
+  const t = token();
+  if (!t) return null;
+  try {
+    const res = await request(`${SUPERVISOR_BASE}/states`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${t}` },
+    });
+    if (res.statusCode !== 200) return null;
+    const body = await res.body.text();
+    return JSON.parse(body) as Array<{ entity_id: string; state: string; attributes: Record<string, unknown> }>;
+  } catch {
+    return null;
+  }
+}

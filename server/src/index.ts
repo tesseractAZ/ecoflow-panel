@@ -18,6 +18,7 @@ import { isConfigured } from './notify.js';
 // v0.9.18 — ship-wide audible broadcast to HomePod/Sonos via HA media_player.
 import { generateAudioAssets } from './audioAssets.js';
 import { startBroadcastMonitor } from './broadcast.js';
+import { getAllStates } from './haService.js';
 import {
   getDayForecast,
   computeDegradation,
@@ -929,6 +930,74 @@ app.post<{ Body: { level?: 'red' | 'yellow' | 'green' } }>(
     return r;
   },
 );
+
+/**
+ * v0.9.19 — discover every media_player entity HA knows about so the
+ * user can pick targets from a real list instead of guessing entity IDs.
+ * We use the manufacturer + model hints HA exposes to label HomePods vs
+ * Sonos vs Apple TV vs generic Cast vs Echo, so the user sees what each
+ * speaker actually is.
+ *
+ * Returns:
+ *   {
+ *     supervised: boolean,
+ *     count: number,
+ *     speakers: [
+ *       { entity_id, friendly_name, family: 'sonos'|'homepod'|'cast'|'echo'|'androidtv'|'apple_tv'|'unknown',
+ *         state, volume_level, source, currently_configured: boolean }
+ *     ]
+ *   }
+ */
+app.get('/api/broadcast/discover', async (_req, reply) => {
+  const cfg = broadcast.config();
+  const all = await getAllStates();
+  if (!all) {
+    reply.code(503);
+    return { supervised: false, count: 0, speakers: [], error: 'SUPERVISOR_TOKEN missing or HA unreachable' };
+  }
+  const configured = new Set(cfg.targets);
+  const speakers = all
+    .filter((s) => s.entity_id.startsWith('media_player.'))
+    .map((s) => {
+      const a = s.attributes ?? {};
+      const friendly = String(a.friendly_name ?? s.entity_id.replace(/^media_player\./, ''));
+      const family = familyOf(s.entity_id, a);
+      return {
+        entity_id: s.entity_id,
+        friendly_name: friendly,
+        family,
+        state: s.state,
+        volume_level: typeof a.volume_level === 'number' ? a.volume_level : null,
+        source: typeof a.source === 'string' ? a.source : null,
+        currently_configured: configured.has(s.entity_id),
+      };
+    })
+    .sort((a, b) => {
+      // Configured first, then group by family, then alphabetical.
+      if (a.currently_configured !== b.currently_configured) {
+        return a.currently_configured ? -1 : 1;
+      }
+      if (a.family !== b.family) return a.family.localeCompare(b.family);
+      return a.friendly_name.localeCompare(b.friendly_name);
+    });
+  return { supervised: true, count: speakers.length, speakers };
+});
+
+/** Infer the speaker family from the entity_id + attributes — drives the
+ * type column + decides which broadcast helpers (sonos.snapshot etc.) apply. */
+function familyOf(entityId: string, attrs: Record<string, unknown>): string {
+  const id = entityId.toLowerCase();
+  const platform = String(attrs.platform ?? '').toLowerCase();
+  const sourceList = Array.isArray(attrs.source_list) ? attrs.source_list.join(' ').toLowerCase() : '';
+  const dt = String((attrs as any).device_class ?? '').toLowerCase();
+  if (id.includes('sonos') || platform === 'sonos' || sourceList.includes('sonos')) return 'sonos';
+  if (id.includes('homepod') || platform === 'homepod' || /homepod/i.test(String((attrs as any).model ?? ''))) return 'homepod';
+  if (platform === 'apple_tv' || id.includes('apple_tv')) return 'apple_tv';
+  if (platform === 'cast' || id.includes('chromecast') || id.includes('cast') || dt === 'speaker') return 'cast';
+  if (platform === 'alexa_media' || id.includes('echo') || id.includes('alexa')) return 'echo';
+  if (platform === 'androidtv' || id.includes('android_tv') || id.includes('androidtv')) return 'androidtv';
+  return 'unknown';
+}
 
 await app.listen({ host: config.host, port: config.port });
 app.log.info(`EcoFlow panel API listening on http://${config.host}:${config.port}`);
