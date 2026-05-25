@@ -3,6 +3,87 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.14 — 2026-05-25
+
+Performance sweep. Targets the three findings from the 2026-05-25 18:43
+log analysis: heavy analytics (1+ s self-consumption + RTE + ambient-
+thermal), uncached read-mostly endpoints, and JSON serialization cost on
+the hot `/api/ha-state` path. Plus a stack of lower-level wins along the
+way.
+
+### Network layer
+
+- **HTTP gzip / brotli** via `@fastify/compress` on every response over
+  1 KB. JSON payloads typically compress 70-85 %. The savings are most
+  visible over HA Ingress (which terminates TLS, no client-side cache
+  for shell assets) and on mobile.
+- **WebSocket permessage-deflate** at level 6 / 1 KB threshold. The
+  full-snapshot push on every store change drops from ~80 KB to ~12 KB
+  in typical fleet sizes. Configured on the server; modern browsers
+  negotiate it transparently.
+- **`Cache-Control` + ETag** on every read-mostly endpoint (history,
+  ha-state, forecast, runway, RTE, clipping, lifetime-energy,
+  self-consumption, carbon, tariff, probabilistic, multi-day,
+  dispatch-plan, bayesian, pack-risk, pack-risk/v2, repair-issues,
+  nws-alerts, alerts/history, incidents, alert-telemetry, plus the
+  v0.7.5 analytics surface — ~25 endpoints in all). Same-tab refetches
+  return **304 Not Modified** with no body — saves the JSON
+  serialization cost on top of the bandwidth saving.
+
+### Database layer
+
+- **SQL-side bucketing** in `recorder.query(..., bucketSec)`. Before:
+  fetched every raw sample then averaged in JS. After: SQLite does the
+  `GROUP BY` and returns one row per bucket. For chart queries this
+  cuts row counts ~30-100× and JS work proportionally.
+- **`PRAGMA cache_size = 32 MB`**, **`mmap_size = 256 MB`**,
+  **`temp_store = MEMORY`**. The working-set sweet spot for a typical
+  13-device EcoFlow fleet — cold-query disk hits drop dramatically
+  while staying within reasonable resource bounds on a HA Pi.
+
+### Analytics
+
+- **`computeSelfConsumption`** (heaviest in the cache warmer at
+  ~1.3 s pre-fix): 60 metrics-worth of recorder queries switched to
+  60 s SQL-side bucketing. Expected drop to <100 ms.
+- **`computeRoundTripEfficiency`**: same treatment — 350 queries × 1
+  day each, now bucketed to 60 s.
+- **`computeAmbientThermalForecast`**: every consumer already
+  re-buckets to the hour — pushed that to SQL too (3600 s bucket).
+  Per-metric row count drops from 60 k+ to 168.
+
+### Cache warmer expansion
+
+- Now pre-warms **10 more endpoints** that were uncached: thermal-events,
+  equipment-health, shade-report, soiling-decomposition, string-mismatch,
+  ev-window-prediction, charge-curve, internal-resistance, repair-issues,
+  summary/today. First fetch from a fresh page-load now hits <5 ms for
+  these (down from 50-150 ms previously).
+
+### Frontend
+
+- **`<link rel="preconnect">`** to Google Fonts in `index.html` — the
+  first theme switch to B5 (or any non-default theme that loads webfonts)
+  no longer pays a fresh TLS handshake when the `<link>` is injected.
+  Free for default-theme users (browsers drop the preconnect if unused).
+- TrendChart was already lazy-loaded (v0.8.1); recharts (543 KB) only
+  loads when the user actually opens a chart.
+
+### Verification
+
+- 68 tests still pass.
+- Vite build clean — CSS bundle 22 → 23 KB (Starfleet theme tokens),
+  JS unchanged at 67 KB for the eager dashboard chunk.
+
+### Out of scope (deferred)
+
+- **Hourly rollup table** (`samples_hourly`) for true 6-hour+ window
+  integration. The SQL-side bucketing already takes the cycle well
+  under the 3 s slow-cycle threshold; rollup would be the next step
+  if cycles ever creep back up as the database grows.
+- **Worker-thread offload** for ML inference + Bayesian update. Same
+  reasoning — not needed yet.
+
 ## 0.9.13 — 2026-05-25
 
 Major TUI overhaul. The telnet console (`nc homeassistant.local 2323`)

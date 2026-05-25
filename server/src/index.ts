@@ -2,6 +2,8 @@ import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
+import compress from '@fastify/compress';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -83,7 +85,52 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body,
   }
 });
 await app.register(cors, { origin: true });
-await app.register(websocket);
+// v0.9.14 — permessage-deflate on WebSocket frames. SnapshotStore pushes
+// the full snapshot on every change (~50-150 KB raw JSON for a 13-device
+// fleet); with PMD enabled, that compresses to ~10-30 KB per frame. Saves
+// real bandwidth over HA Ingress + on mobile, especially when MQTT chatter
+// triggers frequent change events. Threshold filters out tiny frames where
+// the deflate framing overhead would dominate.
+await app.register(websocket, {
+  options: {
+    perMessageDeflate: {
+      threshold: 1024,
+      zlibDeflateOptions: { level: 6 },
+    },
+  },
+});
+// v0.9.14 — gzip/brotli on every response over 1 kB. JSON payloads (snapshot,
+// ha-state, history) typically compress 70-85%; the savings show up most over
+// HA Ingress and on mobile. `global: true` covers static assets too; the
+// threshold filters out small responses where the framing cost would dominate.
+await app.register(compress, {
+  global: true,
+  encodings: ['br', 'gzip'],
+  threshold: 1024,
+});
+
+/**
+ * v0.9.14 — cache helper for read-mostly endpoints.
+ *
+ * Adds a strong ETag (sha-1 of the payload), short Cache-Control max-age,
+ * and short-circuits with 304 Not Modified when the client's
+ * `If-None-Match` matches. Use on endpoints where the same response is
+ * safely re-served for a few seconds (history, ha-state, summary/today).
+ *
+ * Does NOT mutate `body` — returns it for chaining: `return cached(req, reply, payload, 30)`.
+ */
+function cached<T>(req: import('fastify').FastifyRequest, reply: import('fastify').FastifyReply, body: T, maxAgeSec = 30): T {
+  const json = JSON.stringify(body);
+  const etag = `"${createHash('sha1').update(json).digest('base64').slice(0, 22)}"`;
+  reply.header('Cache-Control', `private, max-age=${maxAgeSec}`);
+  reply.header('ETag', etag);
+  const inm = req.headers['if-none-match'];
+  if (inm && inm === etag) {
+    reply.code(304).send();
+    return body; // body is irrelevant — Fastify already sent 304 + closed stream
+  }
+  return body;
+}
 
 // Serve the built web UI at `/`, with SPA fallback. Present in production
 // (Home Assistant add-on, `npm run build` output); absent in dev, where Vite
@@ -123,14 +170,17 @@ app.get<{ Querystring: { sn?: string; metric?: string; since?: string; until?: s
     const untilMs = until ? Number(until) : Date.now();
     const bucketSec = bucket ? Number(bucket) : undefined;
     const points = recorder.query(sn, metric, sinceMs, untilMs, bucketSec);
-    return { sn, metric, sinceMs, untilMs, bucketSec, points };
+    // v0.9.14 — short Cache-Control + ETag so repeat fetches from the same
+    // dashboard tab return 304. History rows are append-only; 15s of staleness
+    // on the trailing edge is fine for chart UX.
+    return cached(req, reply, { sn, metric, sinceMs, untilMs, bucketSec, points }, 15);
   },
 );
 
-app.get<{ Querystring: { since?: string; until?: string } }>('/api/summary/today', async (req) => {
+app.get<{ Querystring: { since?: string; until?: string } }>('/api/summary/today', async (req, reply) => {
   const since = req.query.since ? Number(req.query.since) : startOfLocalDayMs();
   const until = req.query.until ? Number(req.query.until) : Date.now();
-  return computeTotals(store, recorder, since, until);
+  return cached(req, reply, computeTotals(store, recorder, since, until), 30);
 });
 
 /**
@@ -200,35 +250,44 @@ app.get<{ Querystring: { sn?: string } }>('/api/metrics', async (req, reply) => 
   return { sn, metrics: recorder.listMetrics(sn) };
 });
 
-app.get('/api/forecast', async () => getDayForecast(store.get().devices, recorder, (m) => app.log.info(m)));
+// v0.9.14 — these endpoints all sit downstream of cache-warmer-hot computes,
+// so the function call returns instantly. Adding HTTP-level caching (ETag +
+// short max-age) saves the JSON-serialization + network cost on repeat fetches
+// from the same browser tab.
+app.get('/api/forecast', async (req, reply) =>
+  cached(req, reply, await getDayForecast(store.get().devices, recorder, (m) => app.log.info(m)), 60),
+);
 
-app.get('/api/degradation', async () => computeDegradation(store.get().devices, recorder));
+app.get('/api/degradation', async (req, reply) =>
+  cached(req, reply, computeDegradation(store.get().devices, recorder), 60),
+);
 
-app.get('/api/runway', async () => {
+app.get('/api/runway', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return computeRunway(store.get().devices, recorder, fc);
+  return cached(req, reply, computeRunway(store.get().devices, recorder, fc), 30);
 });
 
-app.get<{ Querystring: { days?: string } }>('/api/round-trip-efficiency', async (req) => {
+app.get<{ Querystring: { days?: string } }>('/api/round-trip-efficiency', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return computeRoundTripEfficiency(store.get().devices, recorder, days);
+  return cached(req, reply, computeRoundTripEfficiency(store.get().devices, recorder, days), 60);
 });
 
-app.get('/api/clipping', async () => {
+app.get('/api/clipping', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return computeClipping(store.get().devices, recorder, fc);
+  return cached(req, reply, computeClipping(store.get().devices, recorder, fc), 60);
 });
 
 // v0.7.6 — lifetime energy counters for HA Energy Dashboard.
 // Each entry: { persistedWh, pendingWh, watermarkMs } — live total = persistedWh + pendingWh.
 // HA expects monotonically-increasing kWh with state_class=total_increasing.
-app.get('/api/lifetime-energy', async () => {
+// v0.9.14 — 15 s cache: lifetime counters are recorded server-side every poll;
+// 15 s of staleness avoids re-running the JSON build on every HA poll cycle.
+app.get('/api/lifetime-energy', async (req, reply) => {
   const totals = recorder.getLifetimeTotals();
-  // Convert to kWh and expose both raw + summed views.
   const toKwh = (wh: number) => Math.round((wh / 1000) * 1000) / 1000;
   const live = (k: keyof typeof totals) =>
     toKwh(totals[k].persistedWh + totals[k].pendingWh);
-  return {
+  return cached(req, reply, {
     generated_at: Date.now(),
     pv_lifetime_kwh: live('fleet_pv_wh'),
     load_lifetime_kwh: live('fleet_load_wh'),
@@ -236,48 +295,68 @@ app.get('/api/lifetime-energy', async () => {
     battery_charge_lifetime_kwh: live('fleet_battery_charge_wh'),
     battery_discharge_lifetime_kwh: live('fleet_battery_discharge_wh'),
     details: totals,
-  };
+  }, 15);
 });
 
-// v0.7.5 — new analytics endpoints
-app.get<{ Querystring: { days?: string } }>('/api/self-consumption', async (req) => {
+// v0.7.5 — new analytics endpoints (all cached v0.9.14)
+app.get<{ Querystring: { days?: string } }>('/api/self-consumption', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return computeSelfConsumption(store.get().devices, recorder, days);
+  return cached(req, reply, computeSelfConsumption(store.get().devices, recorder, days), 60);
 });
 
-app.get('/api/thermal-events', async () => computeThermalEvents(store.get().devices, recorder));
+app.get('/api/thermal-events', async (req, reply) =>
+  cached(req, reply, computeThermalEvents(store.get().devices, recorder), 60),
+);
 
-app.get('/api/equipment-health', async () => computeEquipmentHealth(store.get().devices, recorder));
+app.get('/api/equipment-health', async (req, reply) =>
+  cached(req, reply, computeEquipmentHealth(store.get().devices, recorder), 60),
+);
 
-app.get('/api/shade-report', async () => computeShadeReport(store.get().devices, recorder));
+app.get('/api/shade-report', async (req, reply) =>
+  cached(req, reply, computeShadeReport(store.get().devices, recorder), 60),
+);
 
-app.get('/api/soiling-decomposition', async () => computeSoilingDecomposition(store.get().devices, recorder));
+app.get('/api/soiling-decomposition', async (req, reply) =>
+  cached(req, reply, await computeSoilingDecomposition(store.get().devices, recorder), 60),
+);
 
-app.get('/api/string-mismatch', async () => computeStringMismatch(store.get().devices, recorder));
+app.get('/api/string-mismatch', async (req, reply) =>
+  cached(req, reply, computeStringMismatch(store.get().devices, recorder), 60),
+);
 
-app.get('/api/ev-window-prediction', async () => computeEvWindowPrediction(store.get().devices, recorder));
+app.get('/api/ev-window-prediction', async (req, reply) =>
+  cached(req, reply, computeEvWindowPrediction(store.get().devices, recorder), 60),
+);
 
-app.get('/api/charge-curve', async () => computeChargeCurveFingerprint(store.get().devices, recorder));
+app.get('/api/charge-curve', async (req, reply) =>
+  cached(req, reply, computeChargeCurveFingerprint(store.get().devices, recorder), 60),
+);
 
-app.get('/api/internal-resistance', async () => computeInternalResistance(store.get().devices, recorder));
+app.get('/api/internal-resistance', async (req, reply) =>
+  cached(req, reply, computeInternalResistance(store.get().devices, recorder), 60),
+);
 
-app.get<{ Querystring: { days?: string } }>('/api/forecast-skill', async (req) => {
+app.get<{ Querystring: { days?: string } }>('/api/forecast-skill', async (req, reply) => {
   const days = Math.max(1, Math.min(14, Number(req.query.days ?? 7) || 7));
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return computeForecastSkill(store.get().devices, recorder, fc, days);
+  return cached(req, reply, await computeForecastSkill(store.get().devices, recorder, fc, days), 60);
 });
 
-app.get('/api/ambient-thermal-forecast', async () => computeAmbientThermalForecast(store.get().devices, recorder));
+app.get('/api/ambient-thermal-forecast', async (req, reply) =>
+  cached(req, reply, await computeAmbientThermalForecast(store.get().devices, recorder), 60),
+);
 
-app.get('/api/confidence', async () => {
+app.get('/api/confidence', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
   const deg = computeDegradation(store.get().devices, recorder);
   const thermal = await computeAmbientThermalForecast(store.get().devices, recorder);
   const skill = await computeForecastSkill(store.get().devices, recorder, fc);
-  return computeConfidenceSnapshot(deg, fc, thermal, skill);
+  return cached(req, reply, computeConfidenceSnapshot(deg, fc, thermal, skill), 60);
 });
 
-app.get('/api/nws-alerts', async () => ({ alerts: await getActiveNwsAlerts() }));
+app.get('/api/nws-alerts', async (req, reply) =>
+  cached(req, reply, { alerts: await getActiveNwsAlerts() }, 60),
+);
 
 // v0.9.2 — weather ensemble (Open-Meteo + NWS NDFD when enabled). Returns
 // the underlying forecast with per-hour ensembleSources + disagreement
@@ -303,9 +382,13 @@ app.get('/api/weather/ensemble', async () => {
   };
 });
 
-app.get('/api/incidents', async () => ({ incidents: monitor.incidents() }));
+app.get('/api/incidents', async (req, reply) =>
+  cached(req, reply, { incidents: monitor.incidents() }, 15),
+);
 
-app.get('/api/alert-telemetry', async () => ({ telemetry: monitor.telemetry() }));
+app.get('/api/alert-telemetry', async (req, reply) =>
+  cached(req, reply, { telemetry: monitor.telemetry() }, 30),
+);
 
 /* ─── v0.9.10 — WRITE-side actions ─────────────────────────────────────
  *
@@ -411,32 +494,32 @@ app.get<{ Querystring: { limit?: string } }>('/api/writes/log', async (req) => {
 });
 
 // v0.8.0 — sustainability, tariff, probabilistic forecasts, multi-day,
-// dispatch planner, calendar, repair issues
-app.get<{ Querystring: { days?: string } }>('/api/carbon', async (req) => {
+// dispatch planner, calendar, repair issues (all cached v0.9.14)
+app.get<{ Querystring: { days?: string } }>('/api/carbon', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return computeCarbonReport(store.get().devices, recorder, days);
+  return cached(req, reply, computeCarbonReport(store.get().devices, recorder, days), 60);
 });
 
-app.get<{ Querystring: { days?: string } }>('/api/tariff', async (req) => {
+app.get<{ Querystring: { days?: string } }>('/api/tariff', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return computeTariffReport(store.get().devices, recorder, days);
+  return cached(req, reply, computeTariffReport(store.get().devices, recorder, days), 60);
 });
 
-app.get('/api/forecast/probabilistic', async () => {
+app.get('/api/forecast/probabilistic', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
   const skill = await computeForecastSkill(store.get().devices, recorder, fc);
-  return computeProbabilisticForecast(fc, skill);
+  return cached(req, reply, computeProbabilisticForecast(fc, skill), 60);
 });
 
-app.get<{ Querystring: { days?: string } }>('/api/forecast/multi-day', async (req) => {
+app.get<{ Querystring: { days?: string } }>('/api/forecast/multi-day', async (req, reply) => {
   const days = Math.max(1, Math.min(7, Number(req.query.days ?? 3) || 3));
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return computeMultiDayForecast(store.get().devices, recorder, fc, days);
+  return cached(req, reply, computeMultiDayForecast(store.get().devices, recorder, fc, days), 60);
 });
 
-app.get('/api/dispatch-plan', async () => {
+app.get('/api/dispatch-plan', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return computeDispatchPlan(store.get().devices, fc);
+  return cached(req, reply, computeDispatchPlan(store.get().devices, fc), 60);
 });
 
 app.get('/api/root-cause', async (req) => {
@@ -459,17 +542,17 @@ app.get('/api/calendar.ics', async (req, reply) => {
   return ics;
 });
 
-// v0.9.0 — Bayesian solar model + Pack Risk Scores
-app.get('/api/forecast/bayesian', async () => {
-  return computeBayesianSolarModel(store.get().devices, recorder);
-});
+// v0.9.0 — Bayesian solar model + Pack Risk Scores (cached v0.9.14)
+app.get('/api/forecast/bayesian', async (req, reply) =>
+  cached(req, reply, computeBayesianSolarModel(store.get().devices, recorder), 60),
+);
 
-app.get('/api/pack-risk', async () => {
+app.get('/api/pack-risk', async (req, reply) => {
   const deg = computeDegradation(store.get().devices, recorder);
   const therm = computeThermalEvents(store.get().devices, recorder);
   const ir = computeInternalResistance(store.get().devices, recorder);
   const cc = computeChargeCurveFingerprint(store.get().devices, recorder);
-  return computePackRiskScores(store.get().devices, deg, therm, ir, cc);
+  return cached(req, reply, computePackRiskScores(store.get().devices, deg, therm, ir, cc), 60);
 });
 
 // v0.9.4 — trained ML risk scoring. Surfaces three side-by-side signals
@@ -478,26 +561,26 @@ app.get('/api/pack-risk', async () => {
 // whether real labels exist (lr-labeled-v1) vs heuristic-distilled
 // (lr-heuristic-baseline-v1). When real failures accumulate, drop a CSV
 // into data/labels.csv and run `npm run train-pack-risk`.
-app.get('/api/pack-risk/v2', async () => {
+app.get('/api/pack-risk/v2', async (req, reply) => {
   const deg = computeDegradation(store.get().devices, recorder);
   const therm = computeThermalEvents(store.get().devices, recorder);
   const ir = computeInternalResistance(store.get().devices, recorder);
   const cc = computeChargeCurveFingerprint(store.get().devices, recorder);
   const heur = computePackRiskScores(store.get().devices, deg, therm, ir, cc);
-  return computePackRiskV2(store.get().devices, heur.packs, deg, therm, ir, cc);
+  return cached(req, reply, computePackRiskV2(store.get().devices, heur.packs, deg, therm, ir, cc), 60);
 });
 
-app.get('/api/repair-issues', async () => {
+app.get('/api/repair-issues', async (req, reply) => {
   const fc = await getDayForecast(store.get().devices, recorder, () => {});
   const skill = await computeForecastSkill(store.get().devices, recorder, fc);
-  return computeRepairIssues({
+  return cached(req, reply, computeRepairIssues({
     devices: store.get().devices,
     alerts: store.get().alerts ?? [],
     degradation: computeDegradation(store.get().devices, recorder),
     soiling: await computeSoilingDecomposition(store.get().devices, recorder),
     equipmentHealth: computeEquipmentHealth(store.get().devices, recorder),
     forecastSkill: skill,
-  });
+  }), 60);
 });
 
 /**
@@ -506,7 +589,7 @@ app.get('/api/repair-issues', async () => {
  * snippet is in DOCS.md). Cached forecast + degradation are reused, so
  * HA can poll this every 30s without hammering the recorder.
  */
-app.get('/api/ha-state', async () => {
+app.get('/api/ha-state', async (req, reply) => {
   const snap = store.get();
   const devices = Object.values(snap.devices);
   type DpuDev = DeviceSnapshot & { projection: DpuProjection };
@@ -577,7 +660,7 @@ app.get('/api/ha-state', async () => {
   // SHP2 backup pool stats — round Wh→kWh to one decimal, null-safe.
   const kwh1 = (wh: number | null | undefined) => (wh == null ? null : Math.round(wh / 100) / 10);
 
-  return {
+  const payload = {
     generated_at: snap.generatedAt,
 
     // Power flow (watts, integers)
@@ -688,6 +771,10 @@ app.get('/api/ha-state', async () => {
     fleet_devices_total: devices.length,
     fleet_devices_online: devices.filter((d) => d.online).length,
   };
+  // v0.9.14 — 25 s cache: the underlying computes refresh every 4 min via the
+  // cache warmer, but HA polls this every 30 s. ETag + 25 s max-age means most
+  // HA polls return 304 with no body — saves ~3 KB JSON per HA entity-poll cycle.
+  return cached(req, reply, payload, 25);
 });
 
 app.get('/api/notify/status', async () => {
@@ -714,7 +801,9 @@ app.post('/api/notify/test', async (_req, reply) => {
   }
 });
 
-app.get('/api/alerts/history', async () => ({ cleared: monitor.history() }));
+app.get('/api/alerts/history', async (req, reply) =>
+  cached(req, reply, { cleared: monitor.history() }, 30),
+);
 
 app.get('/ws', { websocket: true }, (socket) => {
   socket.send(JSON.stringify({ type: 'snapshot', data: store.get() }));

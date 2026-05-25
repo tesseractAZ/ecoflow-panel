@@ -14,8 +14,18 @@ import {
   computeProbabilisticForecast,
   computeMultiDayForecast,
   computeAmbientThermalForecast,
+  computeThermalEvents,
+  computeEquipmentHealth,
+  computeShadeReport,
+  computeSoilingDecomposition,
+  computeStringMismatch,
+  computeEvWindowPrediction,
+  computeChargeCurveFingerprint,
+  computeInternalResistance,
   resetHaStateShortLivedCaches,
 } from './analytics.js';
+import { computeRepairIssues } from './repairIssues.js';
+import { computeTotals, startOfLocalDayMs } from './aggregator.js';
 
 /**
  * v0.9.5 — Cache pre-warmer.
@@ -107,9 +117,38 @@ export function startCacheWarmer(
       const skill = await computeForecastSkill(devices, recorder, fc);
       await safe('probabilistic-forecast', () => computeProbabilisticForecast(fc, skill));
       await safe('ambient-thermal', () => computeAmbientThermalForecast(devices, recorder));
+      // v0.9.14 — extended coverage: every "predictive insights"-tab endpoint
+      // benefits from being pre-warm so its first fetch from a fresh page-load
+      // hits <5 ms instead of recomputing. None of these are slow on their
+      // own, but pre-warming amortizes them across all viewers.
+      await safe('thermal-events', () => computeThermalEvents(devices, recorder));
+      await safe('equipment-health', () => computeEquipmentHealth(devices, recorder));
+      await safe('shade-report', () => computeShadeReport(devices, recorder));
+      await safe('soiling-decomposition', () => computeSoilingDecomposition(devices, recorder));
+      await safe('string-mismatch', () => computeStringMismatch(devices, recorder));
+      await safe('ev-window-prediction', () => computeEvWindowPrediction(devices, recorder));
+      await safe('charge-curve', () => computeChargeCurveFingerprint(devices, recorder));
+      await safe('internal-resistance', () => computeInternalResistance(devices, recorder));
+      // computeRepairIssues takes a pre-assembled context: it merges already-
+      // warmed signals (degradation, soiling, equipment-health, forecast-skill)
+      // into a unified "things to fix" list. Re-using the warmed caches here
+      // keeps the build cheap.
+      await safe('repair-issues', async () => {
+        const snap = store.get();
+        return computeRepairIssues({
+          devices: snap.devices,
+          alerts: snap.alerts ?? [],
+          degradation: computeDegradation(devices, recorder),
+          soiling: await computeSoilingDecomposition(devices, recorder),
+          equipmentHealth: computeEquipmentHealth(devices, recorder),
+          forecastSkill: skill,
+        });
+      });
+      await safe('summary-today', () => computeTotals(store, recorder, startOfLocalDayMs(), Date.now()));
       const totalMs = Date.now() - t0;
       // Log only when cycle is unusually slow (>3s) — otherwise this would
-      // flood the log every 4 min with healthy timings.
+      // flood the log every 4 min with healthy timings. With v0.9.14's
+      // SQL-side bucketing the typical cycle drops well below 1s.
       if (totalMs > 3000) {
         const top = Object.entries(timings).sort((a, b) => b[1] - a[1]).slice(0, 3);
         log(`cache-warmer: slow cycle (${totalMs}ms) — top: ${top.map(([k, v]) => `${k} ${v}ms`).join(', ')}`);

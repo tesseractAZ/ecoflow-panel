@@ -65,6 +65,21 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
+    -- v0.9.14 — 32 MB page cache (negative N = KiB). Default is 2 MB, which
+    -- is too small once the samples table grows past ~50 MB on disk: cold
+    -- queries hit disk for index + data pages. 32 MB easily holds the
+    -- working set (recent few days) for our typical fleet (~13 devices,
+    -- ~30 metrics each). Trivial cost on a HA host.
+    PRAGMA cache_size = -32768;
+    -- mmap_size: let SQLite memory-map up to 256 MB of the db file for
+    -- read paths. Reads from mmap'd pages skip the syscall overhead of
+    -- pread/pwrite. Has no effect if the db is smaller; bounded so we
+    -- don't surprise resource-constrained hosts.
+    PRAGMA mmap_size = 268435456;
+    -- temp_store: in-memory for temp B-trees used by GROUP BY (our new
+    -- SQL-side bucketing query relies on these). Default `0` is "file"
+    -- on some platforms.
+    PRAGMA temp_store = MEMORY;
     CREATE TABLE IF NOT EXISTS samples (
       ts INTEGER NOT NULL,
       sn TEXT NOT NULL,
@@ -233,6 +248,19 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
 
   const queryStmt = db.prepare(
     `SELECT ts, value FROM samples WHERE sn = ? AND metric = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC`,
+  );
+  // v0.9.14 — SQL-side bucketing. Before this, query() read every raw sample
+  // (potentially tens of thousands over a 7-day window) and the caller bucketed
+  // in JS. Now the GROUP BY happens in SQLite, returning ~one row per bucket
+  // and slashing both wire-bytes and JS work for chart queries. The bucket key
+  // is `floor(ts / bucketMs) * bucketMs` (the canonical bucket-start timestamp)
+  // so output matches the legacy JS implementation byte-for-byte.
+  const queryBucketedStmt = db.prepare(
+    `SELECT CAST((ts / ?) AS INTEGER) * ? AS bucket_ts, AVG(value) AS value
+       FROM samples
+      WHERE sn = ? AND metric = ? AND ts >= ? AND ts <= ?
+      GROUP BY bucket_ts
+      ORDER BY bucket_ts ASC`,
   );
   const metricsStmt = db.prepare(`SELECT DISTINCT metric FROM samples WHERE sn = ? ORDER BY metric ASC`);
 
@@ -443,27 +471,15 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
   return {
     insertSnapshot: (snap) => record(extract(snap)),
     query: (sn, metric, sinceMs, untilMs, bucketSec) => {
-      const rows = queryStmt.all(sn, metric, sinceMs, untilMs) as Array<{ ts: number; value: number }>;
-      if (!bucketSec || bucketSec <= 0) return rows;
-      // Average per bucket
-      const bucketMs = bucketSec * 1000;
-      const out: Array<{ ts: number; value: number }> = [];
-      let curBucket = -1;
-      let sum = 0;
-      let count = 0;
-      for (const r of rows) {
-        const b = Math.floor(r.ts / bucketMs) * bucketMs;
-        if (b !== curBucket) {
-          if (count > 0) out.push({ ts: curBucket, value: sum / count });
-          curBucket = b;
-          sum = 0;
-          count = 0;
-        }
-        sum += r.value;
-        count++;
+      if (!bucketSec || bucketSec <= 0) {
+        return queryStmt.all(sn, metric, sinceMs, untilMs) as Array<{ ts: number; value: number }>;
       }
-      if (count > 0) out.push({ ts: curBucket, value: sum / count });
-      return out;
+      // v0.9.14 — bucketing happens in SQLite now (see queryBucketedStmt).
+      // The returned `bucket_ts` is already the canonical bucket-start ts; we
+      // just rename it to `ts` to match the legacy interface.
+      const bucketMs = bucketSec * 1000;
+      const rows = queryBucketedStmt.all(bucketMs, bucketMs, sn, metric, sinceMs, untilMs) as Array<{ bucket_ts: number; value: number }>;
+      return rows.map((r) => ({ ts: r.bucket_ts, value: r.value }));
     },
     listMetrics: (sn) => (metricsStmt.all(sn) as Array<{ metric: string }>).map((r) => r.metric),
     close: () => {
