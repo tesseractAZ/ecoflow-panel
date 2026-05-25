@@ -3,6 +3,94 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.15 — 2026-05-25
+
+New **Starfleet** web theme — modeled strictly on the bridge of the
+**U.S.S. Enterprise NCC-1701 refit** as depicted in *Star Trek: The
+Motion Picture* (1979). Not a re-skin: a wholly separate component
+tree rendered in place of the existing tabbed dashboard.
+
+### Why a new tree, not a re-skin
+
+A real Starfleet bridge isn't organized by "Dashboard / Solar /
+Thermal / EVSE / Strategy / Alerts" — it's organized by **duty
+station**. To honor the source material we route the same data
+through six purpose-built stations matching what a TMP-era bridge
+officer would actually look at:
+
+| Station | TMP role | What we surface |
+|---|---|---|
+| **MAIN VIEWER** | Captain's central display | Plant wireframe schematic + headline vitals |
+| **CONN** | Helm + Navigation | Battery "trajectory", warp factor, runway ETAs |
+| **ENGINEERING** | Scotty's pool table | DPUs as M/AM reactors, main bus, EPS conduits |
+| **SCIENCE** | Spock's overhead sensors | Forecast, pack risk, anomaly analysis |
+| **TACTICAL** | Defensive systems | Alarm list, "deflector reserve" buffer, Condition Red/Yellow/Green |
+| **OPS** | Communications + ship's chronometer | Per-device subsystem state, comm uplink status, stardate |
+
+### TMP-authentic design vocabulary
+
+- **Palette** — warm tan/cream chrome (the iconic jellybean-console
+  surfaces) for the header + station selector; black recessed displays
+  with brass trim for the data panels. Jellybean accent colors for
+  status: oxblood red, amber/orange, mustard yellow, pale green, sky
+  blue, magenta, off-white cream.
+- **Typography** — **Antonio** as the Eurostile/Microgramma-Extended
+  stand-in for headers + readouts (the boxy geometric extended sans
+  that defined the era's display graphics). **Share Tech Mono** for
+  monospaced numeric readouts. All-caps with wide tracking on labels.
+- **Chrome** — the header is a thick tan band with the Starfleet
+  delta, ship designation block (`U.S.S. ECOFLOW · NCC-EFP-01 ·
+  CONSTITUTION (refit)`), and live stardate.
+- **Station selector** — large tan jellybean-style buttons in a row,
+  active station glows amber, Tactical pulses red when there's an
+  active critical alarm.
+- **Data panels** — black recessed background with brass borders, an
+  amber section title with status dot, optional departmental color
+  stripe (oxblood for Engineering, sky-blue for Science, etc.) down
+  the left edge.
+- **Ring gauges** — concentric brass-trimmed dials with 270° sweep,
+  ticks, setpoint marker, centered Eurostile readout — straight off
+  the V'ger scan and Khan's nebula-targeting displays.
+- **Wireframe schematic** — Main Viewer renders a top-down "blueprint"
+  of the plant: PV array → reactor bank → main bus → loads, in thin
+  amber vector lines on a faint blueprint grid, with a sun symbol on
+  the PV node and per-reactor SOC bars in the DPU stack.
+- **Vocabulary** — "M/AM" (matter/antimatter) for the DPU pool,
+  "E.P.S. conduits" for SHP2 feeders, "deflectors" for the reserve
+  charge buffer, "subspace anomaly analysis" for pack risk, "long-
+  range sensors" for the forecast, "comm array" for the EcoFlow cloud
+  uplink, "warp factor" for net battery power (impulse < 50 W,
+  warp 1 < 200 W, …, warp 8+ ≥ 6 kW). "WORKING…" blinker on panels
+  that are computing.
+- **Alert vocabulary** — "Condition Green / Yellow Alert / Red
+  Alert" replaces "ok / warning / critical".
+
+### How to activate
+
+Theme picker chip in the header (existing affordance) now has three
+options: **Default**, **Babylon 5**, **Starfleet**. Selection
+persists to localStorage. Switching themes is instantaneous — no
+reload — and the Starfleet bundle is lazy-loaded (40 kB / 10 kB gz),
+so users who don't select it pay nothing.
+
+### Architecture
+
+- New directory `web/src/starfleet/` with `StarfleetBridge.tsx`
+  (top-level shell), `components/` (delta shield SVG, ring gauge SVG,
+  bridge panel frame, station tab bar, jellybean indicator array,
+  wireframe schematic), `stations/` (one file per station), and
+  `utils.ts` (stardate computation, ship designation, formatters).
+- `App.tsx` checks `theme === 'starfleet'` at the top and
+  short-circuits to the bridge; the existing Default/B5 tree is
+  untouched.
+- New theme tokens + 250+ lines of Starfleet-specific CSS
+  (`[data-theme="starfleet"]` + `.sf-*` classes) in `index.css`.
+  None of those classes affect Default/B5 — strict scoping.
+- Antonio + Share Tech Mono lazy-loaded from Google Fonts only when
+  the Starfleet theme is first selected.
+
+68 server tests still pass; web build clean.
+
 ## 0.9.14 — 2026-05-25
 
 Performance sweep. Targets the three findings from the 2026-05-25 18:43
