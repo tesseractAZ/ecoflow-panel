@@ -1,15 +1,21 @@
 /**
- * Minimal service worker for EcoFlow Panel PWA (v0.8.0).
+ * Minimal service worker for EcoFlow Panel PWA.
  *
  * Strategy:
  *   - Static assets (HTML, JS, CSS, images): stale-while-revalidate.
- *   - API requests (/api/*, /ws): NEVER cached — telemetry must be live.
+ *   - API requests (/api/* anywhere in the path, /ws): NEVER cached.
  *
- * Lets the panel install as a PWA on iOS / Android / desktop and keep
- * the shell available offline, but always show live data when online.
+ * v0.9.5 — the API-detection regex now matches `/api/` anywhere in the
+ * pathname (not just the start) so live data bypasses cache both on
+ * direct LAN (:8787/api/...) and under HA Ingress
+ * (/api/hassio_ingress/<token>/api/...). Without this, requests through
+ * Ingress would be served from cache instead of hitting the live add-on.
  */
-const CACHE = 'ecoflow-panel-v0.8.0';
-const STATIC_ASSETS = ['/', '/manifest.webmanifest'];
+const CACHE = 'ecoflow-panel-v0.9.5';
+// No pre-cached static assets — let the SW lazily cache whatever the page
+// actually fetches. Avoids `caches.addAll` failing when running under a
+// subpath (the absolute '/' wouldn't match the ingress mount point).
+const STATIC_ASSETS = [];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -28,8 +34,11 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  // Live data — bypass cache entirely.
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) return;
+  // Live data — bypass cache entirely. Match `/api/...` anywhere in the
+  // path AND any URL ending in `/ws` (websocket upgrade). Catches both
+  // direct LAN (/api/snapshot, /ws) and Ingress
+  // (/api/hassio_ingress/<token>/api/snapshot, .../ws).
+  if (/\/api\//.test(url.pathname) || /\/ws$/.test(url.pathname)) return;
   // Static — stale-while-revalidate.
   event.respondWith(
     caches.open(CACHE).then((cache) =>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { LineChart, Line, ResponsiveContainer, YAxis } from 'recharts';
+import { apiUrl } from '../api';
 
 interface Point {
   ts: number;
@@ -27,7 +28,7 @@ export function Sparkline({ sn, metric, windowMs = 60 * 60 * 1000, refreshMs = 3
     const load = async () => {
       const since = Date.now() - windowMs;
       try {
-        const r = await fetch(`/api/history?sn=${encodeURIComponent(sn)}&metric=${encodeURIComponent(metric)}&since=${since}`);
+        const r = await fetch(apiUrl(`api/history?sn=${encodeURIComponent(sn)}&metric=${encodeURIComponent(metric)}&since=${since}`));
         if (!r.ok) return;
         const data = (await r.json()) as { points: Point[] };
         if (mountedRef.current) setPoints(data.points);

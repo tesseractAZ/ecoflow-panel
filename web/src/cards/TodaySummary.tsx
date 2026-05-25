@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { fmtWh } from '../format';
+import { apiUrl } from '../api';
 
 interface IntegrationResult {
   wh: number;
@@ -28,7 +29,7 @@ export function TodaySummary() {
     let cancelled = false;
     const load = async () => {
       try {
-        const r = await fetch('/api/summary/today');
+        const r = await fetch(apiUrl('api/summary/today'));
         if (!r.ok) return;
         const j = (await r.json()) as SummaryResp;
         if (!cancelled) setData(j);

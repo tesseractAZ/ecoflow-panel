@@ -19,7 +19,10 @@ import { getDayForecast, computeDegradation } from '../analytics.js';
 import type { DayForecast } from '../analytics.js';
 import { renderScreen, SCREENS, getDpus } from './screens.js';
 import type { ScreenId, SessionView } from './screens.js';
-import { HIDE_CURSOR, SHOW_CURSOR, CLEAR_SCREEN, CURSOR_HOME, CLEAR_EOL, CLEAR_BELOW, RESET } from './ansi.js';
+import {
+  HIDE_CURSOR, SHOW_CURSOR, CLEAR_SCREEN, CURSOR_HOME, CLEAR_EOL, CLEAR_BELOW, RESET,
+  ENTER_ALT_BUFFER, EXIT_ALT_BUFFER, BEGIN_SYNC, END_SYNC,
+} from './ansi.js';
 
 /* ── Telnet protocol bytes ── */
 const IAC = 255;
@@ -45,6 +48,14 @@ interface Session {
   alertScroll: number;
   inbuf: Buffer;
   timer: NodeJS.Timeout | null;
+  /** v0.9.5 — true while a frame is being written; prevents overlapping draws
+   *  from interleaving (e.g. a NAWS event triggering a mid-frame redraw on
+   *  top of the periodic 1s redraw). Cleared as soon as socket.write returns. */
+  drawing: boolean;
+  /** v0.9.5 — a redraw was requested while drawing was in flight; honor it
+   *  immediately after the current frame finishes so user input still feels
+   *  instant without ever overlapping writes. */
+  drawPending: boolean;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -217,29 +228,57 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
 
   const draw = (s: Session) => {
     if (s.socket.destroyed) return;
-    const sv: SessionView = {
-      width: s.width,
-      height: s.height,
-      screen: s.screen,
-      battDpu: s.battDpu,
-      battPack: s.battPack,
-      alertScroll: s.alertScroll,
-    };
-    // computeDegradation is internally cached (~30 min), so calling it per
-    // render is cheap — the work runs at most twice an hour.
-    const lines = renderScreen(sv, {
-      snap: store.get(),
-      totals,
-      forecast,
-      degradation: computeDegradation(store.get().devices, recorder),
-    });
-    let out = HIDE_CURSOR + CURSOR_HOME;
-    for (let i = 0; i < lines.length; i++) {
-      out += lines[i] + CLEAR_EOL;
-      if (i < lines.length - 1) out += '\r\n';
+    // v0.9.5 — serialize frames. If a draw is already in flight, mark a
+    // pending redraw and bail. The completing frame will run the pending
+    // one on its way out. Eliminates the "two writes racing into the same
+    // ANSI stream" class of glitch.
+    if (s.drawing) {
+      s.drawPending = true;
+      return;
     }
-    out += CLEAR_BELOW;
-    safeWrite(s, out);
+    s.drawing = true;
+    s.drawPending = false;
+    try {
+      const sv: SessionView = {
+        width: s.width,
+        height: s.height,
+        screen: s.screen,
+        battDpu: s.battDpu,
+        battPack: s.battPack,
+        alertScroll: s.alertScroll,
+      };
+      // computeDegradation is internally cached (~30 min), so calling it per
+      // render is cheap — the work runs at most twice an hour.
+      const lines = renderScreen(sv, {
+        snap: store.get(),
+        totals,
+        forecast,
+        degradation: computeDegradation(store.get().devices, recorder),
+      });
+      // v0.9.5 — wrap each frame in:
+      //   BEGIN_SYNC      → terminal buffers all output, no partial render
+      //   CLEAR_SCREEN+HOME → start from a known empty state (eliminates
+      //                       leftover characters from prior frames when
+      //                       this frame is shorter / narrower)
+      //   …content…
+      //   END_SYNC        → terminal flips atomically to the new frame
+      let out = BEGIN_SYNC + HIDE_CURSOR + CLEAR_SCREEN + CURSOR_HOME;
+      for (let i = 0; i < lines.length; i++) {
+        out += lines[i] + CLEAR_EOL;
+        if (i < lines.length - 1) out += '\r\n';
+      }
+      out += CLEAR_BELOW + END_SYNC;
+      safeWrite(s, out);
+    } finally {
+      s.drawing = false;
+      // Honor a pending redraw queued during this frame.
+      if (s.drawPending) {
+        s.drawPending = false;
+        // Schedule on the next tick so we don't grow the call stack on rapid
+        // keypress + interval coincidence.
+        setImmediate(() => draw(s));
+      }
+    }
   };
 
   const endSession = (s: Session) => {
@@ -251,7 +290,11 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
     }
     try {
       if (!s.socket.destroyed) {
-        s.socket.write(SHOW_CURSOR + RESET + '\r\n');
+        // v0.9.5 — restore the user's primary screen buffer + cursor on exit
+        // so their terminal returns to whatever was visible before they ran
+        // `telnet`. Without ?1049l the alt-buffer remains active and they'd
+        // see a blank terminal until they manually re-enter primary mode.
+        s.socket.write(SHOW_CURSOR + RESET + EXIT_ALT_BUFFER + '\r\n');
         s.socket.end();
       }
     } catch {
@@ -324,6 +367,8 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
       alertScroll: 0,
       inbuf: Buffer.alloc(0),
       timer: null,
+      drawing: false,
+      drawPending: false,
     };
     sessions.add(s);
     log(`telnet: client connected from ${socket.remoteAddress ?? '?'} (${sessions.size} active)`);
@@ -337,7 +382,9 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
         IAC, DO, OPT_NAWS,
       ]),
     );
-    safeWrite(s, HIDE_CURSOR + CLEAR_SCREEN);
+    // v0.9.5 — enter alt-screen buffer so we don't pollute the user's
+    // scrollback and our frame boundaries can't smear into earlier output.
+    safeWrite(s, ENTER_ALT_BUFFER + HIDE_CURSOR + CLEAR_SCREEN);
     draw(s);
     s.timer = setInterval(() => draw(s), 1000);
 

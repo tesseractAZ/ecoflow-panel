@@ -50,6 +50,7 @@ import { buildCalendarIcs } from './calendar.js';
 import { computeRepairIssues } from './repairIssues.js';
 import { getWeather } from './weather.js';
 import { computePackRiskV2 } from './ml.js';
+import { startCacheWarmer } from './cacheWarmer.js';
 
 // REST polling cadence. MQTT now delivers per-cmdId fresh data, but we keep a
 // 60s REST poll as a baseline for fields that MQTT doesn't emit and as recovery
@@ -637,6 +638,16 @@ try {
   app.log.error(`mqtt-discovery: failed to start: ${e?.message ?? e}`);
 }
 
+// v0.9.5 — cache pre-warmer. Runs the heavy /api/ha-state computations
+// every 4 min so request-path callers always hit warm caches (was: every
+// 5 min the next /api/ha-state caller paid ~1.8s rebuilding everything).
+const cacheWarmer = startCacheWarmer(store, recorder, (m) => app.log.info(m));
+
+// Diagnostics: per-task warm timings + alert-monitor stats.
+app.get('/api/cache-warmer/status', async () => ({
+  timings: cacheWarmer.lastTimings(),
+}));
+
 await app.listen({ host: config.host, port: config.port });
 app.log.info(`EcoFlow panel API listening on http://${config.host}:${config.port}`);
 
@@ -647,6 +658,7 @@ const shutdown = async () => {
   monitor.stop();
   stopTelnet?.();
   stopMqttDiscovery?.();
+  cacheWarmer.stop();
   recorder.close();
   await app.close();
   process.exit(0);

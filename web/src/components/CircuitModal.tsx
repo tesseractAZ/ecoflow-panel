@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { fmtW, fmtWh } from '../format';
 import type { Shp2Circuit, CircuitHistory, CircuitDayTotal } from '../types';
+import { apiUrl } from '../api';
 
 interface Point {
   ts: number;
@@ -48,8 +49,8 @@ export function CircuitModal({
     const load = async () => {
       const since = Date.now() - 24 * 60 * 60 * 1000;
       const [r1, r2] = await Promise.all([
-        fetch(`/api/history?sn=${sn}&metric=ch${circuit.ch}_w&since=${since}&bucket=60`),
-        fetch(`/api/circuit/history?sn=${sn}&ch=${circuit.ch}&days=${HISTORY_DAYS}`),
+        fetch(apiUrl(`api/history?sn=${sn}&metric=ch${circuit.ch}_w&since=${since}&bucket=60`)),
+        fetch(apiUrl(`api/circuit/history?sn=${sn}&ch=${circuit.ch}&days=${HISTORY_DAYS}`)),
       ]);
       const j1 = (await r1.json()) as { points: Point[] };
       const j2 = (await r2.json()) as CircuitHistory;

@@ -18,6 +18,27 @@ export const CURSOR_HOME = `${ESC}[H`;
 export const CLEAR_EOL = `${ESC}[K`;
 export const CLEAR_BELOW = `${ESC}[J`;
 
+// v0.9.5 — alt screen buffer + synchronous output mode. Without these the
+// TUI was glitching: partial frames from a previous redraw would leak in
+// when a key/NAWS event triggered an extra draw mid-render, and leftover
+// content from a wider previous frame would peek through on resize.
+//
+// `?1049h` puts the terminal in the "alternate screen" — separate from the
+// user's scrollback, so our redraws can't smear into earlier output, and
+// returning to the primary screen on disconnect cleanly restores whatever
+// they had visible before connecting.
+//
+// `?2026h`...`?2026l` is the standard synchronized-update sequence (Kitty,
+// iTerm2, Alacritty, WezTerm, recent VTE). The terminal queues output
+// between the bracketing escapes and renders one atomic frame at `2026l`
+// — eliminating the "characters appearing during refresh" artifacts. On
+// terminals that don't recognize it the sequences are silently consumed
+// (they don't render as visible bytes).
+export const ENTER_ALT_BUFFER = `${ESC}[?1049h`;
+export const EXIT_ALT_BUFFER = `${ESC}[?1049l`;
+export const BEGIN_SYNC = `${ESC}[?2026h`;
+export const END_SYNC = `${ESC}[?2026l`;
+
 function sgr(codes: number[], s: string): string {
   return `${ESC}[${codes.join(';')}m${s}${RESET}`;
 }

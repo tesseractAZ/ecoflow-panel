@@ -3,6 +3,7 @@ import type { Alert, Severity, ClearedAlert } from '../types';
 import { alertCounts } from '../alerts';
 import { fmtRel, fmtMins } from '../format';
 import { SEV_META, SubjectBoxes } from '../cards/AlertParts';
+import { apiUrl } from '../api';
 
 interface NotifyStatus {
   channel: string;
@@ -72,7 +73,7 @@ function ClearedAlertsCard() {
     let live = true;
     const load = async () => {
       try {
-        const r = await fetch('/api/alerts/history');
+        const r = await fetch(apiUrl('api/alerts/history'));
         if (r.ok && live) {
           const j = (await r.json()) as { cleared: ClearedAlert[] };
           setCleared(j.cleared ?? []);
@@ -143,7 +144,7 @@ function NotificationCard() {
 
   const load = async () => {
     try {
-      const r = await fetch('/api/notify/status');
+      const r = await fetch(apiUrl('api/notify/status'));
       if (r.ok) setStatus(await r.json());
     } catch {
       /* ignore */
@@ -159,7 +160,7 @@ function NotificationCard() {
     setTestState('sending');
     setTestMsg('');
     try {
-      const r = await fetch('/api/notify/test', { method: 'POST' });
+      const r = await fetch(apiUrl('api/notify/test'), { method: 'POST' });
       const j = await r.json();
       if (j.ok) {
         setTestState('ok');

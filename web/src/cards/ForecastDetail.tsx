@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { DayForecast, ForecastHour, HourResponse, SolarResponseModel, DeviceSolarModel } from '../types';
 import { fmtW } from '../format';
+import { apiUrl } from '../api';
 
 /**
  * Forecast detail for the Predictive Insights page — shows the full machinery
@@ -48,7 +49,7 @@ export function ForecastDetail() {
     let live = true;
     const load = async () => {
       try {
-        const r = await fetch('/api/forecast');
+        const r = await fetch(apiUrl('api/forecast'));
         if (!live) return;
         if (r.ok) {
           setFc(await r.json());

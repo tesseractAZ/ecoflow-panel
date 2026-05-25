@@ -11,6 +11,7 @@ import {
 import type { DeviceSnapshot, DpuProjection, Shp2Projection } from '../types';
 import { fmtMins, fmtPct, fmtTemp, fmtW, fmtWh } from '../format';
 import { sortDevices } from '../sort';
+import { apiUrl } from '../api';
 
 interface Point {
   ts: number;
@@ -104,7 +105,7 @@ export function EvsePanel({ devices }: { devices: Record<string, DeviceSnapshot>
     let cancelled = false;
     const load = async () => {
       try {
-        const r = await fetch(`/api/debug/raw?sn=${evse.sn}`);
+        const r = await fetch(apiUrl(`api/debug/raw?sn=${evse.sn}`));
         const j = (await r.json()) as DebugResp;
         if (!cancelled) setDebug(j);
       } catch {
@@ -129,7 +130,7 @@ export function EvsePanel({ devices }: { devices: Record<string, DeviceSnapshot>
     let cancelled = false;
     const load = async () => {
       const since = Date.now() - 24 * 60 * 60 * 1000;
-      const r = await fetch(`/api/history?sn=${resolved.sn}&metric=${resolved.metric}&since=${since}&bucket=60`);
+      const r = await fetch(apiUrl(`api/history?sn=${resolved.sn}&metric=${resolved.metric}&since=${since}&bucket=60`));
       const j = (await r.json()) as { points: Point[] };
       if (cancelled) return;
       setHistory(j.points);

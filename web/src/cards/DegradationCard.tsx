@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { FleetDegradation, PackDegradation, DegradeStatus, RoundTripEfficiency } from '../types';
+import { apiUrl } from '../api';
 
 /**
  * Battery degradation — per-pack capacity-fade → end-of-life projection.
@@ -59,8 +60,8 @@ export function DegradationCard() {
     const load = async () => {
       try {
         const [rD, rR] = await Promise.all([
-          fetch('/api/degradation'),
-          fetch('/api/round-trip-efficiency'),
+          fetch(apiUrl('api/degradation')),
+          fetch(apiUrl('api/round-trip-efficiency')),
         ]);
         if (!live) return;
         if (rD.ok) setDeg(await rD.json());
