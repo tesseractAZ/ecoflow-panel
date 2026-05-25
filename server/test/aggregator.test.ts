@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { integrateWh, startOfLocalDayMs } from '../src/aggregator.js';
+import { integrateWh, startOfLocalDayMs, circuitHistoryByDay } from '../src/aggregator.js';
+import type { Recorder } from '../src/recorder.js';
 
 /**
  * Tests for the trapezoidal kWh integrator + gap behavior. This function
@@ -124,4 +125,62 @@ test('startOfLocalDayMs(specific date) — operates on supplied date, not now', 
   assert.equal(d.getMonth(), 4); // May
   assert.equal(d.getDate(), 15);
   assert.equal(d.getHours(), 0);
+});
+
+/* ─── circuitHistoryByDay metric override (v0.9.8) ─────────────────────── */
+
+/**
+ * Minimal mock Recorder. We only care that `circuitHistoryByDay` queries the
+ * right metric — the actual integration math is exercised by the integrateWh
+ * tests above, so we just record which (sn, metric) was asked for.
+ */
+function mockRecorder(byMetric: Record<string, Array<{ ts: number; value: number }>>): Recorder & { lastMetric: string | null } {
+  let lastMetric: string | null = null;
+  return {
+    insertSnapshot: () => {},
+    query: (_sn, metric, sinceMs, untilMs) => {
+      lastMetric = metric;
+      const pts = byMetric[metric] ?? [];
+      return pts.filter((p) => p.ts >= sinceMs && p.ts <= untilMs);
+    },
+    listMetrics: () => Object.keys(byMetric),
+    close: () => {},
+    rollupLifetime: () => {},
+    getLifetimeTotals: () => ({}),
+    get lastMetric() { return lastMetric; },
+  } as Recorder & { lastMetric: string | null };
+}
+
+test('circuitHistoryByDay — defaults to ch${ch}_w metric', () => {
+  const rec = mockRecorder({});
+  circuitHistoryByDay(rec, 'SN', 10, 1);
+  assert.equal(rec.lastMetric, 'ch10_w');
+});
+
+test('circuitHistoryByDay — metric override uses pair${primaryCh}_w for paired circuits', () => {
+  // Same primary channel (10) but we want the *combined* paired series.
+  // This is the v0.9.8 fix that lets CircuitModal show 240 V loads in full.
+  const rec = mockRecorder({});
+  circuitHistoryByDay(rec, 'SN', 10, 1, 'pair10_w');
+  assert.equal(rec.lastMetric, 'pair10_w');
+});
+
+test('circuitHistoryByDay — paired metric integrates to combined kWh', () => {
+  // Build a single in-progress day where pair10_w sits at 2000 W (~Pool Pump
+  // running on both legs) for an hour starting at local midnight. Expected
+  // result for that day's running total: ~2 kWh, with one >0-coverage day.
+  const todayStart = startOfLocalDayMs();
+  const oneHour = 60 * 60_000;
+  const fiveMin = 5 * 60_000;
+  const pts: Array<{ ts: number; value: number }> = [];
+  for (let t = todayStart; t <= todayStart + oneHour; t += fiveMin) {
+    pts.push({ ts: t, value: 2000 });
+  }
+  const rec = mockRecorder({ pair10_w: pts });
+  const h = circuitHistoryByDay(rec, 'SN', 10, 1, 'pair10_w');
+  assert.equal(h.days.length, 1);
+  // ~2 kWh from 2000 W × 1 h. Allow ±0.05 kWh for rounding + clock drift.
+  assert.ok(Math.abs(h.days[0].kwh - 2) < 0.05, `expected ~2 kWh, got ${h.days[0].kwh}`);
+  assert.equal(h.days[0].peakW, 2000);
+  assert.equal(h.ch, 10); // still keyed by primary leg
 });

@@ -137,22 +137,29 @@ app.get<{ Querystring: { since?: string; until?: string } }>('/api/summary/today
  * Per-circuit daily kWh history for the CircuitModal's multi-day comparison.
  * Returns the last `days` (default 7, max 30) of trapezoidal kWh + peak watt +
  * peak timestamp + coverage, plus a summary block (avg, peak day, min day).
+ *
+ * v0.9.8 — accepts `?pair=N` as an alternative to `?ch=N`. When `pair` is set,
+ * the response integrates the combined `pair${N}_w` series (both legs of a
+ * split-phase circuit), so clicking on something like the Pool Pump shows the
+ * full 240 V load instead of just one leg's ~half.
  */
-app.get<{ Querystring: { sn?: string; ch?: string; days?: string } }>(
+app.get<{ Querystring: { sn?: string; ch?: string; pair?: string; days?: string } }>(
   '/api/circuit/history',
   async (req, reply) => {
-    const { sn, ch, days } = req.query;
-    if (!sn || !ch) {
+    const { sn, ch, pair, days } = req.query;
+    if (!sn || (!ch && !pair)) {
       reply.code(400);
-      return { error: 'sn and ch required' };
+      return { error: 'sn and (ch or pair) required' };
     }
-    const chNum = Number(ch);
+    const raw = pair ?? ch!;
+    const chNum = Number(raw);
     if (!Number.isInteger(chNum) || chNum < 1) {
       reply.code(400);
-      return { error: 'ch must be a positive integer' };
+      return { error: 'ch/pair must be a positive integer' };
     }
     const daysNum = Math.max(1, Math.min(30, Number(days ?? 7) || 7));
-    return circuitHistoryByDay(recorder, sn, chNum, daysNum);
+    const metric = pair ? `pair${chNum}_w` : undefined;
+    return circuitHistoryByDay(recorder, sn, chNum, daysNum, metric);
   },
 );
 

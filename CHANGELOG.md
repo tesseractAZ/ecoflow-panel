@@ -3,6 +3,43 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.8 — 2026-05-25
+
+UX fix — the circuit-detail modal was showing only one leg of a paired
+(240 V split-phase) circuit. Clicking the Pool Pump tile (which reads
+~350 W combined) opened a modal that showed ~175 W, peaks, kWh, and 7-day
+history all halved.
+
+### Bug fix
+
+- **CircuitModal shows the full paired load when opened from a paired
+  tile.** The server already records `pair${primaryCh}_w` (sum of both
+  legs) for every split-phase circuit, but the modal was hard-coded to
+  query `ch${ch}_w` for one leg. Now:
+  - `circuitHistoryByDay()` accepts an optional `metric` override.
+  - `/api/circuit/history` accepts `?pair=N` as an alternative to `?ch=N`
+    and queries the pre-summed paired series.
+  - `Shp2Card` passes the paired-circuit object alongside the primary
+    leg when the user clicks a paired tile.
+  - `CircuitModal` accepts an optional `pair` prop; when present and
+    split-phase, it queries the paired series for both the 24 h chart
+    and the multi-day kWh history, and shows `Now / Peak / Avg / Today`
+    in the combined frame.
+  - The modal header switches to e.g. `SHP2 · circuits 10+11 ·
+    15A double-pole · 240 V` so the reader knows which slice they're
+    looking at.
+
+Single-leg circuits and the "show legs" toggle on Shp2Card are
+unchanged — those still show one channel at a time, by design.
+
+### Tests
+
+- +3 tests in `aggregator.test.ts` covering the metric override:
+  default `ch${ch}_w` selection, explicit `pair${primaryCh}_w` override,
+  and end-to-end kWh integration against a synthetic paired-circuit
+  series (~2 kWh from 2000 W × 1 h). 66 tests total (63 → 66), all
+  pass.
+
 ## 0.9.7 — 2026-05-25
 
 Hotfix — the v0.9.6 reboot button errored

@@ -7,7 +7,9 @@ import { RebootButton } from '../components/RebootButton';
 
 export function Shp2Card({ d }: { d: DeviceSnapshot & { projection?: Shp2Projection } }) {
   const p = d.projection;
-  const [selected, setSelected] = useState<Shp2Circuit | null>(null);
+  // v0.9.8 — track both the leg (for breaker/single-leg fields) and the pair
+  // (for combined 240 V chart + kWh history) when the user clicks a paired tile.
+  const [selected, setSelected] = useState<{ circuit: Shp2Circuit; pair?: Shp2PairedCircuit } | null>(null);
   const [showLegs, setShowLegs] = useState(false);
   return (
     <div className="card col-span-full">
@@ -75,7 +77,7 @@ export function Shp2Card({ d }: { d: DeviceSnapshot & { projection?: Shp2Project
                       <button
                         type="button"
                         key={c.ch}
-                        onClick={() => setSelected(c)}
+                        onClick={() => setSelected({ circuit: c })}
                         className={`text-left bg-panel2 border ${active ? 'border-ok/30' : 'border-line'} rounded-lg p-2 hover:border-accent/60 transition-colors`}
                       >
                         <div className="flex items-baseline justify-between">
@@ -103,7 +105,7 @@ export function Shp2Card({ d }: { d: DeviceSnapshot & { projection?: Shp2Project
                       <button
                         type="button"
                         key={pc.primaryCh}
-                        onClick={() => primaryCircuit && setSelected(primaryCircuit)}
+                        onClick={() => primaryCircuit && setSelected({ circuit: primaryCircuit, pair: pc })}
                         className={`text-left bg-panel2 border ${active ? 'border-ok/30' : 'border-line'} rounded-lg p-3 hover:border-accent/60 transition-colors`}
                       >
                         <div className="flex items-baseline justify-between">
@@ -159,7 +161,14 @@ export function Shp2Card({ d }: { d: DeviceSnapshot & { projection?: Shp2Project
         </div>
       )}
 
-      {selected && p && <CircuitModal sn={d.sn} circuit={selected} onClose={() => setSelected(null)} />}
+      {selected && p && (
+        <CircuitModal
+          sn={d.sn}
+          circuit={selected.circuit}
+          pair={selected.pair}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </div>
   );
 }
