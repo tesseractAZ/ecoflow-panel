@@ -13,7 +13,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { fmtW, fmtWh } from '../format';
-import type { Shp2Circuit, CircuitHistory, CircuitDayTotal } from '../types';
+import type { Shp2Circuit, Shp2PairedCircuit, CircuitHistory, CircuitDayTotal } from '../types';
 import { apiUrl } from '../api';
 
 interface Point {
@@ -23,18 +23,43 @@ interface Point {
 
 const HISTORY_DAYS = 7;
 
+/**
+ * v0.9.8 — when a paired (split-phase) circuit is clicked from Shp2Card,
+ * the modal must show the combined load across both legs, not just the
+ * primary. We solve this with an optional `pair` prop:
+ *
+ *   - `circuit` always holds the primary leg (for breaker amps, link
+ *     marker, "Now" watts — `pair.watts` is already the sum)
+ *   - When `pair` is set + paired, we query the server's pre-summed
+ *     `pair${primaryCh}_w` metric for both the 24-h chart and the
+ *     multi-day kWh history (the server respects `?pair=N`).
+ *   - Header/labels switch to "circuits N+M · 240 V · NA double-pole"
+ *     so the user understands which slice they're looking at.
+ */
 export function CircuitModal({
   sn,
   circuit,
+  pair,
   onClose,
 }: {
   sn: string;
   circuit: Shp2Circuit;
+  pair?: Shp2PairedCircuit;
   onClose: () => void;
 }) {
   const [points, setPoints] = useState<Point[]>([]);
   const [todayWh, setTodayWh] = useState<number | null>(null);
   const [history, setHistory] = useState<CircuitHistory | null>(null);
+
+  // A paired *split-phase* tile is the only case where we want the combined
+  // series. Paired but single-leg (no secondary, isSplitPhase = false) falls
+  // back to the normal ch${primary}_w metric — there's nothing to combine.
+  const useCombined = !!pair && pair.isSplitPhase && pair.secondaryCh != null;
+  const seriesMetric = useCombined ? `pair${pair!.primaryCh}_w` : `ch${circuit.ch}_w`;
+  const histQuery = useCombined ? `pair=${pair!.primaryCh}` : `ch=${circuit.ch}`;
+  const nowWatts = useCombined ? pair!.watts : circuit.watts;
+  const breakerAmps = useCombined ? pair!.breakerAmps : circuit.setAmp;
+  const title = useCombined ? pair!.name : circuit.name;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -49,8 +74,8 @@ export function CircuitModal({
     const load = async () => {
       const since = Date.now() - 24 * 60 * 60 * 1000;
       const [r1, r2] = await Promise.all([
-        fetch(apiUrl(`api/history?sn=${sn}&metric=ch${circuit.ch}_w&since=${since}&bucket=60`)),
-        fetch(apiUrl(`api/circuit/history?sn=${sn}&ch=${circuit.ch}&days=${HISTORY_DAYS}`)),
+        fetch(apiUrl(`api/history?sn=${sn}&metric=${seriesMetric}&since=${since}&bucket=60`)),
+        fetch(apiUrl(`api/circuit/history?sn=${sn}&${histQuery}&days=${HISTORY_DAYS}`)),
       ]);
       const j1 = (await r1.json()) as { points: Point[] };
       const j2 = (await r2.json()) as CircuitHistory;
@@ -79,10 +104,14 @@ export function CircuitModal({
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [sn, circuit.ch]);
+  }, [sn, seriesMetric, histQuery]);
 
   const peak = points.length > 0 ? Math.max(...points.map((p) => p.value)) : null;
   const avg = points.length > 0 ? points.reduce((s, p) => s + p.value, 0) / points.length : null;
+
+  const subtitle = useCombined
+    ? `SHP2 · circuits ${pair!.primaryCh}+${pair!.secondaryCh} · ${breakerAmps ?? '—'}A double-pole · 240 V`
+    : `SHP2 · circuit ${circuit.ch} · ${breakerAmps ?? '—'}A breaker`;
 
   return (
     <div
@@ -95,14 +124,14 @@ export function CircuitModal({
       >
         <div className="flex items-start justify-between mb-2">
           <div>
-            <div className="text-xs text-muted">SHP2 · circuit {circuit.ch} · {circuit.setAmp ?? '—'}A breaker</div>
-            <div className="text-xl font-semibold">{circuit.name}</div>
+            <div className="text-xs text-muted">{subtitle}</div>
+            <div className="text-xl font-semibold">{title}</div>
           </div>
           <button onClick={onClose} className="text-muted hover:text-ink text-2xl leading-none px-2">×</button>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-          <Stat label="Now" value={fmtW(circuit.watts)} />
+          <Stat label="Now" value={fmtW(nowWatts)} />
           <Stat label="Peak (24h)" value={fmtW(peak)} />
           <Stat label="Average (24h)" value={fmtW(avg)} />
           <Stat label="Today" value={fmtWh(todayWh)} />

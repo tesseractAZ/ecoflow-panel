@@ -130,23 +130,30 @@ const localDateStr = (ms: number): string => {
  * Per-day kWh totals (trapezoidal, gap-aware) for one SHP2 circuit over the
  * last `days` calendar days, including the in-progress today as a partial /
  * running-total entry. Capped server-side; callers in `index.ts` clamp `days`.
+ *
+ * v0.9.8 — accepts an optional `metric` override so paired (split-phase)
+ * circuits can integrate the combined `pair${primaryCh}_w` series instead
+ * of just one leg's `ch${ch}_w`. The `ch` field in the response is still
+ * the primary leg for stable URL semantics.
  */
 export function circuitHistoryByDay(
   recorder: Recorder,
   sn: string,
   ch: number,
   days: number,
+  metric?: string,
 ): CircuitHistory {
   const out: CircuitDayTotal[] = [];
   const now = Date.now();
   const todayStart = startOfLocalDayMs();
   const ONE_DAY = 86_400_000;
+  const seriesMetric = metric ?? `ch${ch}_w`;
 
   for (let i = days - 1; i >= 0; i--) {
     const dayStart = todayStart - i * ONE_DAY;
     const dayEndFull = dayStart + ONE_DAY;
     const dayEnd = i === 0 ? now : dayEndFull;
-    const pts = recorder.query(sn, `ch${ch}_w`, dayStart, dayEnd);
+    const pts = recorder.query(sn, seriesMetric, dayStart, dayEnd);
     const integ = integrateWh(pts, dayStart, dayEnd);
     let peakW = 0;
     let peakAtMs: number | null = null;
