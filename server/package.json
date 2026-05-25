@@ -13,6 +13,7 @@
     "train-pack-risk": "tsx scripts/train-pack-risk.ts"
   },
   "dependencies": {
+    "@fastify/compress": "^8.3.1",
     "@fastify/cors": "^10.0.1",
     "@fastify/static": "^9.1.3",
     "@fastify/websocket": "^11.0.1",

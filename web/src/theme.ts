@@ -109,6 +109,11 @@ export const THEMES = [
     name: 'Babylon 5',
     description: 'Earthforce / Babylon Station system UI — deep navy + station cyan + amber accents.',
   },
+  {
+    id: 'starfleet' as const,
+    name: 'Starfleet',
+    description: 'USS Enterprise NCC-1701 refit bridge (Star Trek: The Motion Picture). New layout, new stations, new chrome — not a re-skin.',
+  },
 ];
 
 export type ThemeId = (typeof THEMES)[number]['id'];
@@ -137,6 +142,17 @@ export function applyTheme(id: ThemeId) {
     link.rel = 'stylesheet';
     link.href =
       'https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Share+Tech+Mono&display=swap';
+    document.head.appendChild(link);
+  }
+  // v0.9.14 — Starfleet (TMP era) fonts. Antonio for Eurostile-feel
+  // (geometric extended sans for headers/labels), Saira Condensed for
+  // body, Share Tech Mono for monospaced numeric readouts.
+  if (id === 'starfleet' && !document.getElementById('theme-starfleet-fonts')) {
+    const link = document.createElement('link');
+    link.id = 'theme-starfleet-fonts';
+    link.rel = 'stylesheet';
+    link.href =
+      'https://fonts.googleapis.com/css2?family=Antonio:wght@400;700&family=Saira+Condensed:wght@400;600&family=Share+Tech+Mono&display=swap';
     document.head.appendChild(link);
   }
 }
