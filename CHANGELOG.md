@@ -3,6 +3,71 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.19 — 2026-05-25
+
+**Speaker discovery for v0.9.18 broadcasts.** The previous release
+required the user to know their `media_player` entity IDs by heart
+when filling in `BROADCAST_TARGETS`. This release adds a "Sensor
+Sweep" button that queries Home Assistant directly and lists every
+speaker it knows about, color-coded by family (HomePod, Sonos, Cast,
+Echo, Apple TV, AndroidTV) with friendly names + live state +
+current volume.
+
+### How it works
+
+The add-on already has `SUPERVISOR_TOKEN` (HA grants it to every
+add-on for free), so we hit `GET http://supervisor/core/api/states`,
+filter for entities starting with `media_player.`, and classify each
+by inspecting the platform attribute + entity-ID hints. The list is
+sorted with currently-configured targets first, then by family, then
+alphabetical.
+
+### Usage
+
+In the Starfleet bridge → **OPS** station, the **SHIPWIDE INTERCOM**
+panel now has:
+
+1. **◐ SENSOR SWEEP** button — fetches the live media_player list
+2. **Checkbox list** with family icon + friendly name + entity ID + state
+3. **◈ COPY (n) FOR BROADCAST_TARGETS** button — copies the
+   comma-separated entity-ID string ready to paste into the add-on
+   Configuration tab
+4. Currently-configured speakers pre-check on load so the user sees
+   their existing selection
+
+### New endpoint
+
+`GET /api/broadcast/discover` returns:
+```json
+{
+  "supervised": true,
+  "count": 8,
+  "speakers": [
+    {
+      "entity_id": "media_player.living_room",
+      "friendly_name": "Living Room",
+      "family": "sonos",
+      "state": "playing",
+      "volume_level": 0.35,
+      "source": "Spotify",
+      "currently_configured": true
+    },
+    …
+  ]
+}
+```
+
+Family classifications: `sonos`, `homepod`, `apple_tv`, `cast`,
+`echo`, `androidtv`, `unknown`. Useful for both the in-bridge UI and
+external scripting (e.g. `curl http://homeassistant.local:8787/api/broadcast/discover | jq`).
+
+### No new configuration
+
+The discovery endpoint is read-only and exposes only entity IDs,
+friendly names, and current state — same info already visible in HA's
+Developer Tools → States. No new env vars, no new tokens, no changes
+to the existing v0.9.18 broadcast logic.
+
 ## 0.9.18 — 2026-05-25
 
 **Ship-wide audible broadcasts.** v0.9.17 added Starfleet alert sounds
