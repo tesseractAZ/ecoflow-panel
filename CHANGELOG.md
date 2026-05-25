@@ -3,6 +3,78 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.29 — 2026-05-25
+
+**Cache-warmer perf.** Field-log analysis on a 4-DPU fleet showed warmer
+cycles burning 3.3–3.6 s of wall time per pass, with three 5-min-TTL
+functions dominating: self-consumption (~720 ms), round-trip-efficiency
+(~650 ms), equipment-health (~520 ms). Root cause across all three was
+SQL round-trip count — the same composite (sn, metric, ts) index was
+fine, but the JS-side loops were issuing hundreds of one-metric queries
+per cycle and materializing millions of `{ts, value}` objects.
+
+### Recorder
+
+- **New `queryMulti(sn, metrics[], …)`** — single SQL call with
+  `metric IN (?, ?, …)`, returning `Map<metric, points[]>`. Prepared
+  statements are cached per (metricCount, bucketed) shape, so the hot
+  callers re-use the same compiled SQL across cycles. Cuts per-call
+  overhead (statement-bind + page-cache lookups) by ~6× when pulling
+  multiple metrics from the same device.
+- **`ANALYZE samples` at startup** — refresh query-planner statistics
+  so the planner keeps pace with row-count skew as the DB grows. Cheap
+  (single-digit ms) on a single index.
+
+### Analytics — query count + window strategy
+
+- **round-trip-efficiency**: was `(days × dpus × packs × 2)` =
+  **280 SQL round-trips per cycle**. Now `(dpus)` = **4 round-trips**,
+  using `queryMulti` for the full 7-day window, then JS-bucketing by
+  day off the pre-fetched 60s-bucketed array. As a bonus, `integrateWh`
+  can now see the previous day's trailing sample as a `lastBefore`
+  anchor — small accuracy improvement at day boundaries.
+- **self-consumption**: was **49 SQL round-trips** (1 per metric per
+  DPU + 1 SHP2 panel_load). Now `(dpus + 1)` = **5 round-trips**, using
+  one `queryMulti` per DPU for `pv_total + ac_in + all pack metrics`.
+- **equipment-health**: this was the worst — **24 unbucketed 60-day
+  pulls per cycle** in `ratioSeries()` + `inverterStandby`. On a
+  typical fleet ~450k raw rows per metric × 24 queries = **ten million
+  rows materialized in JS per cycle**, all to compute medians and
+  linear trends. Added 5-min SQL bucketing (signal-loss-free for the
+  slow-moving medians + trend fits this function emits), and batched
+  via `queryMulti`. Per-cycle rowcount drops ~17× and round-trips drop
+  3×.
+- **clipping**: was `24 × dpus` = **96 round-trips** (one per hour per
+  DPU). Now `dpus` = **4 round-trips**, pre-fetched at 60s bucketing
+  and hour-bucketed in JS.
+- **tariff**: was `(7 × 24) × (dpus + 1)` = **~840 round-trips per
+  cycle** (hourly walk × per-metric query). Now `(dpus + 1)` =
+  **5 round-trips**, with hourly `integrateWh` calls running off the
+  pre-fetched arrays.
+- **string-mismatch**: was a 14-day unbucketed `pv_total` pull per DPU
+  (~400k raw rows). Now 5-min bucketed (~13k rows per DPU). 30× row
+  reduction with no impact on the per-hour-of-day median this function
+  emits.
+- **Hour-of-day curve helpers** (`hourCurve`, `hourCurveByWeekday`,
+  `pvHourlyByEpoch`): all three feed long-window per-hour means/medians
+  used by the day-forecast, Bayesian solar, and multi-day forecast.
+  Added 5-min SQL bucketing — ~30× row reduction with no curve change.
+
+### Tests
+
+- **3 new query-budget tests in `analytics.test.ts`** (now 100 total,
+  was 97). Each pins the upper-bound `queryMulti` count for one of the
+  three hot functions so a future refactor that reintroduces an N+1
+  pattern fails CI before it ships. Budgets scale linearly in
+  `(dpus × packs)`, not `(days × dpus × packs × 2)`.
+
+### Expected impact in production
+
+Round-trip count drops from ~1,200 per warmer cycle to ~25.
+Conservatively expect the three reported hot functions to land below
+100 ms each (from 500–720 ms), bringing total warmer cycle wall time
+from 3.3–3.6 s down to ~600–900 ms on the reported fleet shape.
+
 ## 0.9.28 — 2026-05-25
 
 **Multi-track model advance.** Ships one meaningful module on every

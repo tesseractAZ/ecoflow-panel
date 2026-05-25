@@ -49,6 +49,19 @@ export interface LifetimeTotals {
 export interface Recorder {
   insertSnapshot: (snap: FleetSnapshot) => void;
   query: (sn: string, metric: string, sinceMs: number, untilMs: number, bucketSec?: number) => Array<{ ts: number; value: number }>;
+  /** v0.9.29 — batched read: one SQL call returns rows for many (sn, metric)
+   * pairs, keyed by metric. Cuts per-query overhead (statement-bind +
+   * page-cache lookups) by ~6× when the caller has many metrics to pull
+   * for a single device, e.g. equipment-health pulling pv_high + pv_high_v
+   * + pv_high_a together. Result is a Map<metric, Array<{ts, value}>>; a
+   * metric with no rows appears as an empty array, never missing. */
+  queryMulti: (
+    sn: string,
+    metrics: string[],
+    sinceMs: number,
+    untilMs: number,
+    bucketSec?: number,
+  ) => Map<string, Array<{ ts: number; value: number }>>;
   listMetrics: (sn: string) => string[];
   close: () => void;
   /** Force a lifetime-rollup tick (used by tests / on shutdown). */
@@ -93,6 +106,18 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       last_integrated_ts INTEGER NOT NULL DEFAULT 0
     );
   `);
+
+  // v0.9.29 — refresh query-planner statistics. Without this, after a fresh
+  // install (samples table empty when ANALYZE last ran), SQLite assumes the
+  // composite index is uniform and may pick a less-efficient plan once
+  // samples skew (e.g. one metric having 50× the rows of another). ANALYZE
+  // on every startup is cheap on a single index — single-digit ms even at
+  // millions of rows — and lets the planner keep pace with growth.
+  try {
+    db.exec(`ANALYZE samples;`);
+  } catch (e: any) {
+    log(`recorder: ANALYZE skipped (${e?.message ?? e})`);
+  }
 
   const insert = db.prepare(`INSERT INTO samples (ts, sn, metric, value) VALUES (?, ?, ?, ?)`);
   const insertMany = db.prepare(`INSERT INTO samples (ts, sn, metric, value) VALUES (?, ?, ?, ?)`);
@@ -263,6 +288,36 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       ORDER BY bucket_ts ASC`,
   );
   const metricsStmt = db.prepare(`SELECT DISTINCT metric FROM samples WHERE sn = ? ORDER BY metric ASC`);
+
+  // v0.9.29 — multi-metric batched fetch. Single statement, IN-list bound at
+  // call time. The query planner uses the composite (sn, metric, ts) index
+  // and walks each metric's segment in turn; the result set comes back
+  // already grouped by metric (within metric, by ts ASC). The hot callers
+  // (equipment-health, self-consumption) used to do one db.prepare().all()
+  // per metric — 6 round-trips per device — and now do one. We cache the
+  // prepared statement per (metricCount, bucketed) tuple because `node:sqlite`
+  // re-prepares on every new SQL string, and ratioSeries always uses the
+  // same shape (3 metrics, unbucketed or 5-min-bucketed).
+  const queryMultiStmtCache = new Map<string, ReturnType<typeof db.prepare>>();
+  const getQueryMultiStmt = (metricCount: number, bucketed: boolean) => {
+    const key = `${metricCount}|${bucketed ? 'b' : 'r'}`;
+    let stmt = queryMultiStmtCache.get(key);
+    if (stmt) return stmt;
+    const placeholders = new Array(metricCount).fill('?').join(',');
+    const sql = bucketed
+      ? `SELECT metric, CAST((ts / ?) AS INTEGER) * ? AS bucket_ts, AVG(value) AS value
+           FROM samples
+          WHERE sn = ? AND metric IN (${placeholders}) AND ts >= ? AND ts <= ?
+          GROUP BY metric, bucket_ts
+          ORDER BY metric ASC, bucket_ts ASC`
+      : `SELECT metric, ts, value
+           FROM samples
+          WHERE sn = ? AND metric IN (${placeholders}) AND ts >= ? AND ts <= ?
+          ORDER BY metric ASC, ts ASC`;
+    stmt = db.prepare(sql);
+    queryMultiStmtCache.set(key, stmt);
+    return stmt;
+  };
 
   // ─── Lifetime energy accumulator ────────────────────────────────────────
   const lifetimeReadStmt = db.prepare(
@@ -480,6 +535,24 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       const bucketMs = bucketSec * 1000;
       const rows = queryBucketedStmt.all(bucketMs, bucketMs, sn, metric, sinceMs, untilMs) as Array<{ bucket_ts: number; value: number }>;
       return rows.map((r) => ({ ts: r.bucket_ts, value: r.value }));
+    },
+    queryMulti: (sn, metrics, sinceMs, untilMs, bucketSec) => {
+      const out = new Map<string, Array<{ ts: number; value: number }>>();
+      if (metrics.length === 0) return out;
+      // Pre-seed empty arrays so callers can rely on `out.get(metric)` never
+      // returning undefined for a known metric.
+      for (const m of metrics) out.set(m, []);
+      const bucketed = !!bucketSec && bucketSec > 0;
+      const stmt = getQueryMultiStmt(metrics.length, bucketed);
+      const rows = bucketed
+        ? (stmt.all(bucketSec! * 1000, bucketSec! * 1000, sn, ...metrics, sinceMs, untilMs) as Array<{ metric: string; bucket_ts: number; value: number }>)
+        : (stmt.all(sn, ...metrics, sinceMs, untilMs) as Array<{ metric: string; ts: number; value: number }>);
+      for (const r of rows) {
+        const arr = out.get(r.metric);
+        if (!arr) continue; // metric not in requested list (shouldn't happen — defensive)
+        arr.push({ ts: bucketed ? (r as any).bucket_ts : (r as any).ts, value: r.value });
+      }
+      return out;
     },
     listMetrics: (sn) => (metricsStmt.all(sn) as Array<{ metric: string }>).map((r) => r.metric),
     close: () => {
