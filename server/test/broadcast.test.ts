@@ -50,13 +50,35 @@ test('loadBroadcastConfig — defaults are safe (disabled, no targets)', () => {
   delete process.env.BROADCAST_TARGETS;
   delete process.env.BROADCAST_VOLUME;
   delete process.env.BROADCAST_MIN_SEVERITY;
+  delete process.env.BROADCAST_USE_MUSIC_ASSISTANT;
   try {
     const cfg = loadBroadcastConfig();
     assert.equal(cfg.enabled, false);
     assert.equal(cfg.targets.length, 0);
     assert.equal(cfg.minSeverity, 'critical');
     assert.equal(cfg.sonosRestore, true);
+    assert.equal(cfg.backend, 'auto');
     assert.ok(cfg.volume >= 0 && cfg.volume <= 1);
+  } finally {
+    process.env = prev;
+  }
+});
+
+test('loadBroadcastConfig — BROADCAST_USE_MUSIC_ASSISTANT accepts auto/true/false/music_assistant/media_player', () => {
+  const prev = { ...process.env };
+  try {
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'auto';
+    assert.equal(loadBroadcastConfig().backend, 'auto');
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'true';
+    assert.equal(loadBroadcastConfig().backend, 'music_assistant');
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'music_assistant';
+    assert.equal(loadBroadcastConfig().backend, 'music_assistant');
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'false';
+    assert.equal(loadBroadcastConfig().backend, 'media_player');
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'media_player';
+    assert.equal(loadBroadcastConfig().backend, 'media_player');
+    process.env.BROADCAST_USE_MUSIC_ASSISTANT = 'garbage';
+    assert.equal(loadBroadcastConfig().backend, 'auto'); // unknown → auto
   } finally {
     process.env = prev;
   }

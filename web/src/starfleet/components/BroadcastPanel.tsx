@@ -24,6 +24,9 @@ interface BroadcastStatus {
   lastLevel: 'red' | 'yellow' | 'green' | null;
   lastOutcome: 'success' | 'partial' | 'failure' | null;
   lastErrors: string[];
+  lastBackend: 'music_assistant' | 'media_player' | null;
+  musicAssistantAvailable: boolean;
+  testCooldownRemainingMs: number;
   config: {
     enabled: boolean;
     targets: string[];
@@ -33,6 +36,7 @@ interface BroadcastStatus {
     quietHours: [number, number] | null;
     ttsService: string | null;
     sonosRestore: boolean;
+    backend: 'auto' | 'music_assistant' | 'media_player';
   };
 }
 
@@ -190,6 +194,17 @@ export function BroadcastPanel() {
             <span style={{ color: '#f4e8c8' }}>
               {status.config.ttsService || <span style={{ color: '#8c7a5c' }}>klaxon only · no TTS service set</span>}
             </span>
+            <span className="sf-label">BROADCAST PATH</span>
+            <span style={{ color: '#f4e8c8' }}>
+              {(() => {
+                const cfgB = status.config.backend;
+                const active = status.lastBackend ?? (status.musicAssistantAvailable && cfgB !== 'media_player' ? 'music_assistant' : 'media_player');
+                if (active === 'music_assistant') {
+                  return <><span style={{ color: '#6fb854' }}>◉ MUSIC ASSISTANT</span> <span style={{ color: '#8c7a5c' }}>· simultaneous announce (preferred)</span></>;
+                }
+                return <><span style={{ color: '#e89c40' }}>◐ MEDIA PLAYER</span> <span style={{ color: '#8c7a5c' }}>· {status.musicAssistantAvailable ? 'MA detected but forced off' : 'MA not installed — install Music Assistant for synced playback'}</span></>;
+              })()}
+            </span>
             {status.lastBroadcastAt && (
               <>
                 <span className="sf-label">LAST BROADCAST</span>
@@ -318,11 +333,18 @@ export function BroadcastPanel() {
 
           {/* === test buttons === */}
           <div className="pt-3 border-t border-[#5a4520]">
-            <div className="sf-label mb-2">TEST SHIPWIDE TRANSMISSION</div>
+            <div className="sf-label mb-2 flex items-center gap-2">
+              <span>TEST SHIPWIDE TRANSMISSION</span>
+              {status.testCooldownRemainingMs > 0 && (
+                <span style={{ color: '#e89c40', fontSize: 10 }}>
+                  · COOLDOWN {Math.ceil(status.testCooldownRemainingMs / 1000)}s
+                </span>
+              )}
+            </div>
             <div className="grid grid-cols-3 gap-2">
-              <TestBtn label="RED ALERT" color="#c4242a" busy={busy === 'red'} onClick={() => test('red')} />
-              <TestBtn label="YELLOW ALERT" color="#e89c40" busy={busy === 'yellow'} onClick={() => test('yellow')} />
-              <TestBtn label="ALL CLEAR" color="#6fb854" busy={busy === 'green'} onClick={() => test('green')} />
+              <TestBtn label="RED ALERT" color="#c4242a" busy={busy === 'red'} cooldown={status.testCooldownRemainingMs > 0} onClick={() => test('red')} />
+              <TestBtn label="YELLOW ALERT" color="#e89c40" busy={busy === 'yellow'} cooldown={status.testCooldownRemainingMs > 0} onClick={() => test('yellow')} />
+              <TestBtn label="ALL CLEAR" color="#6fb854" busy={busy === 'green'} cooldown={status.testCooldownRemainingMs > 0} onClick={() => test('green')} />
             </div>
             {lastTest && (
               <div className="mt-3 text-xs" style={{ fontFamily: 'Antonio, sans-serif', color: lastTest.ok ? '#6fb854' : '#c4242a' }}>
@@ -345,15 +367,16 @@ export function BroadcastPanel() {
 
 function pad2(n: number) { return String(n).padStart(2, '0'); }
 
-function TestBtn({ label, color, busy, onClick }: { label: string; color: string; busy: boolean; onClick: () => void }) {
+function TestBtn({ label, color, busy, cooldown, onClick }: { label: string; color: string; busy: boolean; cooldown?: boolean; onClick: () => void }) {
+  const disabled = busy || !!cooldown;
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={busy}
+      disabled={disabled}
       style={{
-        background: busy ? '#3a2c1a' : `linear-gradient(180deg, ${color} 0%, ${dim(color)} 100%)`,
-        color: busy ? '#8c7a5c' : '#0a0806',
+        background: disabled ? '#3a2c1a' : `linear-gradient(180deg, ${color} 0%, ${dim(color)} 100%)`,
+        color: disabled ? '#8c7a5c' : '#0a0806',
         border: '1px solid #5a4520',
         borderRadius: 3,
         padding: '0.55rem 0.5rem',
@@ -362,11 +385,11 @@ function TestBtn({ label, color, busy, onClick }: { label: string; color: string
         fontSize: 11,
         letterSpacing: '0.16em',
         textTransform: 'uppercase',
-        boxShadow: busy ? undefined : `inset 0 1px 0 rgb(255 255 255 / 0.25), 0 0 12px ${color}66`,
-        cursor: busy ? 'not-allowed' : 'pointer',
+        boxShadow: disabled ? undefined : `inset 0 1px 0 rgb(255 255 255 / 0.25), 0 0 12px ${color}66`,
+        cursor: disabled ? 'not-allowed' : 'pointer',
       }}
     >
-      {busy ? '◐ TRANSMITTING…' : label}
+      {busy ? '◐ TRANSMITTING…' : cooldown ? '◊ COOLDOWN' : label}
     </button>
   );
 }

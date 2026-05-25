@@ -100,6 +100,8 @@ if bashio::config.true 'BROADCAST_SONOS_RESTORE'; then
 else
   export BROADCAST_SONOS_RESTORE=false
 fi
+# v0.9.23 — MA backend selection
+export BROADCAST_USE_MUSIC_ASSISTANT="$(bashio::config 'BROADCAST_USE_MUSIC_ASSISTANT')"
 if bashio::config.true 'BROADCAST_ENABLED'; then
   bashio::log.info "broadcast: enabled (targets: $BROADCAST_TARGETS)"
 fi
