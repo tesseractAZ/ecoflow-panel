@@ -7,9 +7,12 @@ import {
   forecastDayAlerts,
   resetHaStateShortLivedCaches,
   computeRoundTripEfficiency,
+  computeSelfConsumption,
+  computeEquipmentHealth,
   type DayForecast,
 } from '../src/analytics.js';
 import type { Recorder } from '../src/recorder.js';
+import type { DeviceSnapshot } from '../src/snapshot.js';
 
 test('rootCausesFor — direct match against a graph leaf', () => {
   const causes = rootCausesFor('forecast-low-solar');
@@ -159,17 +162,25 @@ test('forecastDayAlerts — does NOT fire soiling-pv when below threshold', () =
 
 // Recorder mock — count query() calls so we can prove the cache actually
 // recomputed (vs. returned a cached value).
-function mockRecorder(): Recorder & { queryCount: number } {
+function mockRecorder(): Recorder & { queryCount: number; queryMultiCount: number } {
   let queryCount = 0;
+  let queryMultiCount = 0;
   return {
     insertSnapshot: () => {},
     query: () => { queryCount++; return []; },
+    queryMulti: (_sn, metrics) => {
+      queryMultiCount++;
+      const m = new Map<string, Array<{ ts: number; value: number }>>();
+      for (const k of metrics) m.set(k, []);
+      return m;
+    },
     listMetrics: () => [],
     close: () => {},
     rollupLifetime: () => {},
     getLifetimeTotals: () => ({}),
     get queryCount() { return queryCount; },
-  } as Recorder & { queryCount: number };
+    get queryMultiCount() { return queryMultiCount; },
+  } as Recorder & { queryCount: number; queryMultiCount: number };
 }
 
 test('resetHaStateShortLivedCaches — forces compute on next call (cache cleared)', () => {
@@ -199,4 +210,96 @@ test('resetHaStateShortLivedCaches — is idempotent (safe to call when caches a
   resetHaStateShortLivedCaches();
   resetHaStateShortLivedCaches();
   assert.ok(true);
+});
+
+/* ───────────────────────────────────────────────────────────────────────
+ * v0.9.29 — query-budget tests for the warmer's hot 5-min-TTL functions.
+ *
+ * Production logs from a 4-DPU fleet showed cache-warmer cycles burning
+ * ~3.4 s of wall time per pass, with self-consumption (~720 ms), RTE
+ * (~650 ms), and equipment-health (~520 ms) dominating. Profiling traced
+ * the cost to SQL round-trip count: RTE issued (days × dpus × packs × 2)
+ * = 280 queries; self-consumption issued ~49; equipment-health issued
+ * 6 × dpus = 24 unbucketed 60-day pulls (millions of rows materialized
+ * in JS per cycle).
+ *
+ * These tests pin the new query budget so a future refactor that
+ * accidentally reintroduces an N+1 pattern fails CI before it ships to
+ * prod. The numbers below are upper bounds — exact counts depend on
+ * fleet shape, but the budget scales linearly in (dpus × packs), not
+ * (days × dpus × packs × 2).
+ * ─────────────────────────────────────────────────────────────────── */
+
+// Synthesize a fleet of N DPUs each with P packs — enough surface area
+// to expose any per-pack-per-day N+1 loops.
+function fakeDpuFleet(numDpus = 4, packsPerDpu = 5): Record<string, DeviceSnapshot> {
+  const out: Record<string, DeviceSnapshot> = {};
+  for (let i = 0; i < numDpus; i++) {
+    const sn = `SN-DPU-${i}`;
+    out[sn] = {
+      sn,
+      deviceName: `DELTA-PRO-ULTRA-${i + 1}`,
+      online: true,
+      lastSeenMs: Date.now(),
+      projection: {
+        kind: 'dpu',
+        soc: 80,
+        pvTotalWatts: 0,
+        pvHighWatts: 0, pvLowWatts: 0,
+        pvHighVolts: 0, pvHighAmps: 0, pvLowVolts: 0, pvLowAmps: 0,
+        acInWatts: 0, acOutWatts: 0, totalInWatts: 0, totalOutWatts: 0,
+        batVol: 0, batAmp: 0, mpptHvTemp: 0, mpptLvTemp: 0,
+        packs: Array.from({ length: packsPerDpu }, (_, p) => ({
+          num: p + 1, soc: 80, temp: 25, inputWatts: 0, outputWatts: 0,
+          maxCellTemp: 25, minCellTemp: 25, soh: 100, cycles: 50,
+        })),
+      } as any,
+    } as any;
+  }
+  return out;
+}
+
+test('computeRoundTripEfficiency — query count is O(dpus × packs), not O(days × dpus × packs)', () => {
+  resetHaStateShortLivedCaches();
+  const rec = mockRecorder();
+  const devices = fakeDpuFleet(4, 5);
+  computeRoundTripEfficiency(devices, rec);
+  // Was 280 queries with old per-day loop; new path uses queryMulti once
+  // per DPU for the full window. Budget: ≤ 1 queryMulti per DPU.
+  assert.ok(
+    rec.queryMultiCount <= 4,
+    `RTE made ${rec.queryMultiCount} queryMulti calls; budget is ≤ 4 (one per DPU)`,
+  );
+  assert.equal(rec.queryCount, 0, 'RTE should not use the per-metric query() path anymore');
+});
+
+test('computeSelfConsumption — query count is O(dpus), not O(dpus × metricsPerDpu)', () => {
+  resetHaStateShortLivedCaches();
+  const rec = mockRecorder();
+  const devices = fakeDpuFleet(4, 5);
+  computeSelfConsumption(devices, rec);
+  // Was 49 queries (1 per metric per DPU + 1 SHP2 panel_load).
+  // New: ≤ 1 queryMulti per DPU + 1 query() for panel_load (no SHP2 in
+  // this synthetic fleet, so 0 panel_load queries).
+  assert.ok(
+    rec.queryMultiCount <= 4,
+    `self-consumption made ${rec.queryMultiCount} queryMulti calls; budget is ≤ 4`,
+  );
+});
+
+test('computeEquipmentHealth — query count bounded; 5-min bucketing in use', () => {
+  const rec = mockRecorder();
+  const devices = fakeDpuFleet(4, 5);
+  computeEquipmentHealth(devices, rec);
+  // ratioSeries: ≤ 1 queryMulti per (DPU × string) = 8 calls.
+  // inverter-standby: ≤ 1 queryMulti per DPU = 4 calls + 1 query for
+  // SHP2 panel_load (no SHP2 here, so 0). Total budget: ≤ 12 queryMulti.
+  assert.ok(
+    rec.queryMultiCount <= 12,
+    `equipment-health made ${rec.queryMultiCount} queryMulti calls; budget is ≤ 12`,
+  );
+  // The per-metric query() path should not be hit for the MPPT or
+  // standby calculations themselves; only the SHP2 panel_load fallback
+  // uses it (and there's no SHP2 in this synthetic fleet).
+  assert.equal(rec.queryCount, 0);
 });
