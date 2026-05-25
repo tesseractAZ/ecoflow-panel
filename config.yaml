@@ -1,5 +1,5 @@
 name: EcoFlow Panel
-version: "0.9.4"
+version: "0.9.5"
 slug: ecoflow_panel
 description: >-
   Live dashboard + control-room TUI for an EcoFlow off-grid home — SHP2,
@@ -28,6 +28,15 @@ ports:
 ports_description:
   8787/tcp: Web dashboard + REST API + WebSocket
   2323/tcp: Telnet "control-room" TUI (no auth — keep on a trusted LAN)
+# v0.9.5 — HA Ingress: makes the panel appear as a sidebar item inside
+# Home Assistant (visible in the HA mobile app), authenticated through
+# HA's normal session. Same server, same port — HA's hassio_ingress
+# reverse-proxies in. Direct LAN access on :8787 still works.
+ingress: true
+ingress_port: 8787
+panel_icon: mdi:home-battery
+panel_title: EcoFlow Panel
+panel_admin: false
 map:
   - data:rw
 options:

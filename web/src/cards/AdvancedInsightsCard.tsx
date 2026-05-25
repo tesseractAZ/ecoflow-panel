@@ -15,6 +15,7 @@ import type {
   NwsAlert,
   Incident,
 } from '../types';
+import { apiUrl } from '../api';
 
 /**
  * Advanced Insights (v0.7.5) — surfaces the dozen new analytics functions
@@ -42,21 +43,21 @@ export function AdvancedInsightsCard() {
   useEffect(() => {
     const fetchAll = () => {
       const endpoints: Array<[string, (j: any) => void]> = [
-        ['/api/self-consumption', setSc],
-        ['/api/thermal-events', setThermal],
-        ['/api/equipment-health', setEquip],
-        ['/api/shade-report', setShade],
-        ['/api/soiling-decomposition', setSoil],
-        ['/api/string-mismatch', setMismatch],
-        ['/api/ev-window-prediction', setEv],
-        ['/api/charge-curve', setCharge],
-        ['/api/internal-resistance', setIr],
-        ['/api/forecast-skill', setSkill],
-        ['/api/ambient-thermal-forecast', setAmbient],
-        ['/api/confidence', setConf],
-        ['/api/nws-alerts', (j) => setNws(j.alerts ?? [])],
-        ['/api/incidents', (j) => setIncidents(j.incidents ?? [])],
-        ['/api/weather/ensemble', (j) => setEnsemble(j.error ? null : {
+        ['api/self-consumption', setSc],
+        ['api/thermal-events', setThermal],
+        ['api/equipment-health', setEquip],
+        ['api/shade-report', setShade],
+        ['api/soiling-decomposition', setSoil],
+        ['api/string-mismatch', setMismatch],
+        ['api/ev-window-prediction', setEv],
+        ['api/charge-curve', setCharge],
+        ['api/internal-resistance', setIr],
+        ['api/forecast-skill', setSkill],
+        ['api/ambient-thermal-forecast', setAmbient],
+        ['api/confidence', setConf],
+        ['api/nws-alerts', (j) => setNws(j.alerts ?? [])],
+        ['api/incidents', (j) => setIncidents(j.incidents ?? [])],
+        ['api/weather/ensemble', (j) => setEnsemble(j.error ? null : {
           sourcesCount: j.sourcesCount,
           avgDisagreementPct: j.avgDisagreementPct,
           enrichedHourCount: j.enrichedHourCount,
@@ -64,7 +65,7 @@ export function AdvancedInsightsCard() {
         })],
       ];
       for (const [url, setter] of endpoints) {
-        fetch(url).then((r) => r.json()).then(setter).catch(() => {});
+        fetch(apiUrl(url)).then((r) => r.json()).then(setter).catch(() => {});
       }
     };
     fetchAll();

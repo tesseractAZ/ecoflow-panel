@@ -3,6 +3,96 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.5 — 2026-05-25
+
+Three focused improvements driven by real-world usage: a perf fix,
+sidebar entry inside Home Assistant, and TUI glitches eliminated.
+
+### Features
+
+- **HA Ingress — sidebar entry inside Home Assistant.** Adding
+  `ingress: true` + `panel_icon` + `panel_title` to `config.yaml`
+  registers the panel as a sidebar item, visible in the HA mobile
+  app, authenticated through HA's normal session — no separate
+  hostname, no separate login. Direct LAN access on `:8787` still
+  works for power users.
+
+  To make the SPA work under HA's `/api/hassio_ingress/<token>/`
+  reverse-proxy mount point, every absolute URL in the web bundle is
+  now relative:
+  - **`web/src/api.ts`** — new `apiUrl(path)` + `wsUrl()` helpers.
+    Resolve against the SPA's current base directory so the same
+    bundle works at `/` (direct), at `/api/hassio_ingress/<token>/`
+    (Ingress), or any future mount point.
+  - **13 web files updated** to use `apiUrl()` instead of literal
+    `fetch('/api/...')` — every `useEffect`, every chart fetch,
+    every refresh interval.
+  - **`useSnapshot.ts`** WebSocket URL via `wsUrl()`.
+  - **`vite.config.ts`** — `base: './'` so the built bundle
+    references `./assets/...` (relative) instead of `/assets/...`
+    (absolute, which would 404 under Ingress).
+  - **`index.html`** — manifest / icon / SW registration paths
+    converted to relative.
+  - **`sw.js`** — API-detection regex matches `/api/` anywhere in the
+    path (not just the start) so live data bypasses cache under both
+    direct and Ingress mounts.
+
+### Performance
+
+- **Cache pre-warmer (`server/src/cacheWarmer.ts`).** Fixes the 5-min
+  `/api/ha-state` latency spike — most calls returned in 2-3 ms but
+  every 5 min one took ~1.8 s because the carbon / tariff /
+  self-consumption / clipping TTLs (all 5 min) expired roughly
+  together and the next request rebuilt them all on its critical
+  path. The warmer runs every 4 min in the background, calling
+  every heavy compute (12 functions) — `/api/ha-state` always
+  reads warm caches now. Logs a single line only on slow cycles
+  (>3 s total). New `/api/cache-warmer/status` for diagnostics.
+
+### Bug fix — TUI random characters during refresh
+
+- **Alternate screen buffer + synchronous output + serialized
+  draws.** The TUI was glitching on some refreshes because:
+  1. A NAWS resize or rapid keypress could trigger a redraw mid-
+     way through the periodic 1-second redraw — two `socket.write()`
+     calls would interleave at the wire level, smearing the next
+     frame on top of the unfinished previous one.
+  2. The differential clear strategy (`CLEAR_EOL` per line +
+     `CLEAR_BELOW` at end) left leftover content visible when a
+     screen switched to a shorter or narrower layout.
+
+  Three fixes, all in `server/src/telnet/`:
+  - **Alt screen buffer** (`\x1b[?1049h`/`\x1b[?1049l`) — isolates
+    the TUI from the user's scrollback so a partial repaint can't
+    smear into earlier output, and disconnect cleanly restores
+    whatever was visible before.
+  - **Synchronized output mode** (`\x1b[?2026h`/`\x1b[?2026l`) —
+    standard VT control (Kitty, iTerm2, Alacritty, WezTerm, recent
+    VTE). The terminal buffers everything between the bracketing
+    escapes and flips to the new frame atomically. Terminals that
+    don't recognize the sequence silently consume it.
+  - **Serialized draws** — new `drawing` + `drawPending` flags on
+    the session. A draw that arrives while one is already in flight
+    sets `drawPending`; the in-flight frame honors it on
+    `setImmediate()` after completing. No more interleaved writes.
+  - **Full clear** at the start of each frame (`CLEAR_SCREEN +
+    CURSOR_HOME`) replaces the per-line differential approach —
+    tiny network-traffic cost, eliminates "leftover from prior
+    frame" entirely.
+
+### Tests
+
+- 59/59 server tests still passing. No behavioral regressions.
+
+### How to enable the sidebar entry on your Pi
+
+After upgrading to v0.9.5, the HA Supervisor will detect the new
+`ingress: true` in the add-on manifest and add the sidebar item
+automatically. Look in HA's left sidebar for "EcoFlow Panel"
+(`mdi:home-battery` icon). Tap it from the mobile app for the full
+React dashboard, session-authenticated through HA. No port
+forwarding, no separate password.
+
 ## 0.9.4 — 2026-05-25
 
 Trained ML inference framework + a multi-tab HACS dashboard card.

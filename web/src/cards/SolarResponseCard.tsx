@@ -10,6 +10,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import type { DayForecast, SolarResponseModel } from '../types';
+import { apiUrl } from '../api';
 
 const fmtHour = (h: number) => (h === 0 ? '12a' : h < 12 ? `${h}a` : h === 12 ? '12p' : `${h - 12}p`);
 const INV_COLORS = ['#0e7490', '#15803d', '#d97706', '#7c3aed', '#db2777'];
@@ -35,7 +36,7 @@ export function SolarResponseCard() {
     let cancelled = false;
     const load = async () => {
       try {
-        const r = await fetch('/api/forecast');
+        const r = await fetch(apiUrl('api/forecast'));
         if (r.ok && !cancelled) setFc(await r.json());
       } catch {
         /* ignore */

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FleetSnapshot } from './types';
+import { wsUrl } from './api';
 
 export type ConnState = 'connecting' | 'open' | 'closed';
 
@@ -16,8 +17,10 @@ export function useSnapshot(): { snapshot: FleetSnapshot | null; conn: ConnState
     const connect = () => {
       if (stopped) return;
       setConn('connecting');
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      // v0.9.5 — wsUrl() builds the URL relative to the SPA's current path,
+      // so it works both on direct LAN (:8787/ws) and under HA Ingress
+      // (/api/hassio_ingress/<token>/ws).
+      ws = new WebSocket(wsUrl());
       ws.onopen = () => {
         setConn('open');
         retryRef.current = 0;

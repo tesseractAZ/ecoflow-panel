@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { RunwayProjection } from '../types';
+import { apiUrl } from '../api';
 
 /**
  * Live off-grid runway — single most actionable number during a storm.
@@ -14,7 +15,7 @@ export function RunwayCard() {
     let live = true;
     const load = async () => {
       try {
-        const r = await fetch('/api/runway');
+        const r = await fetch(apiUrl('api/runway'));
         if (!live) return;
         if (r.ok) {
           setRunway(await r.json());

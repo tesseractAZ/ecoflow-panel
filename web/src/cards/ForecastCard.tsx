@@ -13,6 +13,7 @@ import {
 } from 'recharts';
 import type { DayForecast } from '../types';
 import { fmtPct, fmtW } from '../format';
+import { apiUrl } from '../api';
 
 /**
  * Day-ahead forecast card: cloud-aware solar prediction, typical-day load, and
@@ -25,7 +26,7 @@ export function ForecastCard() {
     let cancelled = false;
     const load = async () => {
       try {
-        const r = await fetch('/api/forecast');
+        const r = await fetch(apiUrl('api/forecast'));
         if (r.ok && !cancelled) setFc(await r.json());
       } catch {
         /* ignore */

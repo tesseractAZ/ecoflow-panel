@@ -20,6 +20,7 @@ const PANELS_PER_DPU = HV_PANELS + LV_PANELS;
 import { fmtTemp, fmtW, fmtWh } from '../format';
 import { sortDevices } from '../sort';
 import { SolarResponseCard } from '../cards/SolarResponseCard';
+import { apiUrl } from '../api';
 
 const DPU_COLORS = ['#0e7490', '#15803d', '#d97706', '#7c3aed'];
 
@@ -68,7 +69,7 @@ export function SolarPanel({ devices }: { devices: Record<string, DeviceSnapshot
     const load = async () => {
       try {
         // Summary for today's kWh
-        const sumR = await fetch('/api/summary/today');
+        const sumR = await fetch(apiUrl('api/summary/today'));
         const sumJ = (await sumR.json()) as SummaryResp;
         if (!cancelled) setSummary(sumJ);
 
@@ -81,7 +82,7 @@ export function SolarPanel({ devices }: { devices: Record<string, DeviceSnapshot
         let peakTs = 0;
         await Promise.all(
           onlineDpus.map(async (d) => {
-            const r = await fetch(`/api/history?sn=${d.sn}&metric=pv_total&since=${since}&bucket=60`);
+            const r = await fetch(apiUrl(`api/history?sn=${d.sn}&metric=pv_total&since=${since}&bucket=60`));
             const j = (await r.json()) as { points: Point[] };
             next[d.sn] = j.points;
           }),

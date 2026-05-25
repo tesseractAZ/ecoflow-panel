@@ -9,6 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
+import { apiUrl } from '../api';
 
 interface Series {
   sn: string;
@@ -50,7 +51,7 @@ export function TrendChart({
       const results: Record<string, Point[]> = {};
       await Promise.all(
         series.map(async (s) => {
-          const url = `/api/history?sn=${encodeURIComponent(s.sn)}&metric=${encodeURIComponent(s.metric)}&since=${since}${bucketSec ? `&bucket=${bucketSec}` : ''}`;
+          const url = apiUrl(`api/history?sn=${encodeURIComponent(s.sn)}&metric=${encodeURIComponent(s.metric)}&since=${since}${bucketSec ? `&bucket=${bucketSec}` : ''}`);
           try {
             const r = await fetch(url);
             if (!r.ok) return;

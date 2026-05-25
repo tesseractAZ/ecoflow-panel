@@ -2,6 +2,12 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
+  // v0.9.5 — relative base URL so the built bundle works under any mount
+  // point. Direct LAN access at :8787 serves from `/`; HA Ingress serves
+  // from `/api/hassio_ingress/<token>/`. With base:'./' the built assets
+  // reference each other relatively (./assets/index-XYZ.js) so both work
+  // without per-deployment configuration.
+  base: './',
   plugins: [react()],
   server: {
     port: 5173,
