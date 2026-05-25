@@ -1,5 +1,5 @@
 name: EcoFlow Panel
-version: "0.9.22"
+version: "0.9.23"
 slug: ecoflow_panel
 description: >-
   Live dashboard + control-room TUI for an EcoFlow off-grid home — SHP2,
@@ -107,6 +107,15 @@ options:
   # restore it after, so a music session resumes. Leave on unless you
   # see odd behavior.
   BROADCAST_SONOS_RESTORE: true
+  # v0.9.23 — backend selection for broadcast service calls.
+  #   auto             — use music_assistant.play_announcement when MA is
+  #                      installed in HA, else fall back to media_player.play_media
+  #   music_assistant  — force MA path (will fail if MA isn't installed)
+  #   media_player     — never use MA, always use media_player.play_media
+  # MA's announce service plays SIMULTANEOUSLY across all targets (no
+  # per-speaker delay), handles volume override + restore atomically, and
+  # bypasses the music queue. Recommended when MA is installed.
+  BROADCAST_USE_MUSIC_ASSISTANT: auto
 schema:
   ECOFLOW_ACCESS_KEY: password
   ECOFLOW_SECRET_KEY: password
@@ -149,3 +158,4 @@ schema:
   BROADCAST_TTS_SERVICE: "str?"
   BROADCAST_TTS_LANGUAGE: "str?"
   BROADCAST_SONOS_RESTORE: bool
+  BROADCAST_USE_MUSIC_ASSISTANT: list(auto|music_assistant|media_player|true|false)

@@ -913,6 +913,7 @@ app.get('/api/broadcast/status', async () => {
       quietHours: cfg.quietHours,
       ttsService: cfg.ttsService,
       sonosRestore: cfg.sonosRestore,
+      backend: cfg.backend,
     },
   };
 });
@@ -926,7 +927,11 @@ app.post<{ Body: { level?: 'red' | 'yellow' | 'green' } }>(
       return { ok: false, error: 'level must be red, yellow, or green' };
     }
     const r = await broadcast.test(level);
-    if (!r.ok) reply.code(502);
+    // v0.9.23 — 429 when blocked by cooldown, 502 on real failures, 200 ok.
+    if (!r.ok) {
+      const isCooldown = r.cooldownRemainingMs != null && r.cooldownRemainingMs > 0 && r.messages.some((m) => m.startsWith('cooldown:'));
+      reply.code(isCooldown ? 429 : 502);
+    }
     return r;
   },
 );

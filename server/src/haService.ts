@@ -117,6 +117,40 @@ export async function entityExists(entityId: string): Promise<boolean> {
 }
 
 /**
+ * v0.9.23 — fetch the HA service catalog. Used to detect whether
+ * Music Assistant is installed (presence of music_assistant.play_announcement)
+ * so the broadcast loop can prefer its purpose-built announce service
+ * over the slower-and-serialized media_player.play_media path.
+ *
+ * Returns null when not supervised. Returns the raw catalog otherwise —
+ * an array of { domain: string, services: Record<string, ServiceDescriptor> }.
+ */
+export async function getServiceCatalog(): Promise<Array<{ domain: string; services: Record<string, unknown> }> | null> {
+  const t = token();
+  if (!t) return null;
+  try {
+    const res = await request(`${SUPERVISOR_BASE}/services`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${t}` },
+    });
+    if (res.statusCode !== 200) return null;
+    const body = await res.body.text();
+    return JSON.parse(body) as Array<{ domain: string; services: Record<string, unknown> }>;
+  } catch {
+    return null;
+  }
+}
+
+/** True if `<domain>.<service>` exists in the catalog. */
+export async function hasService(domain: string, service: string): Promise<boolean> {
+  const cat = await getServiceCatalog();
+  if (!cat) return false;
+  const d = cat.find((c) => c.domain === domain);
+  if (!d) return false;
+  return service in d.services;
+}
+
+/**
  * v0.9.19 — fetch all entity states. Used by the broadcast-discovery
  * endpoint to enumerate every media_player HA knows about, so the
  * user can pick targets from a real list instead of guessing entity IDs.
