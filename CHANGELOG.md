@@ -3,6 +3,46 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.9 — 2026-05-25
+
+Diagnostic plumbing — the v0.9.6 reboot button errored EcoFlow API code
+8524 ("invalid parameter") because it sent the **DPU command shape**
+(`{ cmdSet, cmdId, params }`) to an **SHP2**, which uses a different
+protocol family (`{ cmdCode, params }`). To make matters worse: the
+authoritative reverse-engineering source (tolwi/hassio-ecoflow-cloud)
+documents 12 SHP2 setters and zero reboot commands — reboot may not
+even be exposed by the public IoT Open API.
+
+So we can't just patch the body and call it done; we need to probe.
+This release ships the probing tools while leaving the reboot button
+in place (it's still safe — failures surface honestly).
+
+### Features
+
+- **`WRITE_DEBUG_TOKEN` add-on config option** (password field). When
+  set, enables `POST /api/device/send-command` with the same secret
+  required in the `x-write-debug-token` header. Off by default; the
+  add-on logs a warning on boot when it's enabled.
+
+- **`scripts/probe-shp2-reboot.sh`** — interactive probe runner. Takes
+  `PANEL_URL`, `WRITE_DEBUG_TOKEN`, `SHP2_SN` env vars, walks through
+  10 candidate command shapes (known SHP2 setter, speculative reboot
+  cmdCodes, legacy SHP1 operateTypes, DPU shape for reference), and
+  prints the EcoFlow response for each. Per-attempt y/N confirmation
+  by default; `--yes` to run unattended.
+
+  If any probe returns `code: 0`, that's the working reboot shape —
+  copy the body into `rebootShp2()` in `server/src/ecoflow/commands.ts`
+  and ship a patch.
+
+### Not yet decided
+
+The reboot button itself still ships with the v0.9.6 best-guess body
+(known to fail 8524). Next move depends on what the probe finds:
+- If a working shape is discovered → patch `rebootShp2()` and ship it.
+- If nothing works → pivot the button to a documented no-op write
+  ("Refresh cloud presence") or remove it entirely.
+
 ## 0.9.8 — 2026-05-25
 
 UX fix — the circuit-detail modal was showing only one leg of a paired

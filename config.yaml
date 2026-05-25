@@ -1,5 +1,5 @@
 name: EcoFlow Panel
-version: "0.9.8"
+version: "0.9.9"
 slug: ecoflow_panel
 description: >-
   Live dashboard + control-room TUI for an EcoFlow off-grid home — SHP2,
@@ -66,6 +66,13 @@ options:
   MQTT_DISCOVERY_USER: ""
   MQTT_DISCOVERY_PASS: ""
   MQTT_DISCOVERY_PREFIX: homeassistant
+  # v0.9.9 — set this to a non-empty secret to enable the diagnostic
+  # POST /api/device/send-command endpoint, used to probe undocumented
+  # EcoFlow commands (e.g. SHP2 reboot — there's no documented public
+  # reboot, so anyone who wants one has to discover the shape empirically).
+  # Leave empty in normal operation. Requires the same value in the
+  # `x-write-debug-token` header on every call.
+  WRITE_DEBUG_TOKEN: ""
 schema:
   ECOFLOW_ACCESS_KEY: password
   ECOFLOW_SECRET_KEY: password
@@ -98,3 +105,4 @@ schema:
   MQTT_DISCOVERY_USER: "str?"
   MQTT_DISCOVERY_PASS: "password?"
   MQTT_DISCOVERY_PREFIX: "str?"
+  WRITE_DEBUG_TOKEN: "password?"
