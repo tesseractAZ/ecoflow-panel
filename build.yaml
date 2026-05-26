@@ -13,33 +13,25 @@ labels:
   org.opencontainers.image.source: https://github.com/tesseractAZ/ecoflow-panel
   org.opencontainers.image.licenses: MIT
 
-# v0.9.45 — CodeNotary image signing.
+# v0.9.48 — CodeNotary image signing REMOVED.
 #
-# Home Assistant Supervisor verifies the published image was signed by
-# the identity in `signer` (a CodeNotary account email) before pulling +
-# running. Provides supply-chain integrity: a hijacked GHCR token alone
-# can't ship a backdoored image — the attacker would also need to forge
-# a signature against this identity, which requires CN_USER+CN_PASSWORD.
+# v0.9.45-47 set up CodeNotary signing (vcn notarize) for a +1 HA
+# security-rating bump. Discovered the hard way during v0.9.47 testing
+# that the OSS vcn project is dead:
+#   - https://github.com/codenotary/vcn → 404 (repo archived/deleted)
+#   - codenotary/vcn:latest Docker image still exists but is amd64-only
+#     (SIGSEGV under QEMU on aarch64 runner)
+#   - GitHub releases page that hosted native binaries: gone
 #
-# `base_image` declares the identity that signed the FROM image. HA's
-# official base images are signed by notary@home-assistant.io, so that
-# value is fixed.
+# Home Assistant's own add-ons repo (home-assistant/addons) no longer
+# references codenotary in their builder workflow either — HA has
+# quietly accepted the same ceiling.
 #
-# `signer` is the identity that signs THIS add-on's image. Must match
-# the CodeNotary account whose credentials live in the CN_USER /
-# CN_PASSWORD GitHub secrets. To change later: update this field +
-# update the GitHub secrets to match.
+# Net result: the rating ceiling for this add-on is ~7 (with AppArmor
+# from v0.9.44), not 8. To go higher would require a different signing
+# scheme that HA Supervisor verifies natively — at time of writing
+# (2026-05-26) that doesn't exist for third-party add-ons.
 #
-# Setup required (one-time):
-#   1. Register CodeNotary account at https://www.codenotary.io with
-#      redacted@example.com.
-#   2. Add GitHub repo secrets:
-#        CN_USER     = redacted@example.com
-#        CN_PASSWORD = <your CodeNotary password>
-#      via https://github.com/tesseractAZ/ecoflow-panel/settings/secrets/actions
-#   3. Next release will sign automatically. The CI step is gated on
-#      both secrets being present, so until step 2 lands the workflow
-#      skips signing without failing.
-codenotary:
-  signer: redacted@example.com
-  base_image: notary@home-assistant.io
+# The CN_USER + CN_PASSWORD secrets in the GitHub repo are harmless if
+# left in place — no workflow references them anymore. Delete via repo
+# Settings → Secrets if you want a clean inventory.

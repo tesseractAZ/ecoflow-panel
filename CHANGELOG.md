@@ -3,6 +3,60 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.48 — 2026-05-26
+
+**Back out CodeNotary signing (vcn project is dead).** v0.9.47 tried
+to install vcn natively to fix the arm64 SIGSEGV from v0.9.45. The
+install step hit `404 Not Found` on the binary download. Investigation:
+
+```
+$ gh api repos/codenotary/vcn
+{"message":"Not Found","documentation_url":"..."}
+```
+
+The entire `codenotary/vcn` GitHub repository has been deleted or
+archived. The `codenotary/vcn:latest` Docker image is still on Docker
+Hub but only as amd64 — there's no maintainer publishing arm64 builds
+or new releases. The OSS CodeNotary community ledger appears
+abandoned.
+
+**Confirmed:** Home Assistant's own `home-assistant/addons` builder
+workflow no longer references codenotary either. HA upstream quietly
+moved on; the rating bonus for codenotary signing is effectively dead.
+
+### What we did
+
+- Removed `codenotary:` block from `build.yaml`. HA Supervisor no
+  longer attempts signature verification on install — the add-on
+  installs cleanly without "signature missing" errors.
+- Removed the `Install vcn` + `Sign image with CodeNotary` steps from
+  `.github/workflows/images.yml`. Publish workflow goes back to:
+  build → push to GHCR. No more 404s, no more SIGSEGVs.
+- Kept the v0.9.44 AppArmor profile (`apparmor.txt`). That's still
+  the +1 rating bump we banked.
+
+### Where the rating actually settles
+
+| Setting | Impact |
+|---|---|
+| `homeassistant_api: true` | −1 (needed for broadcasts/TTS) |
+| `hassio_api: true` | −1 (needed for setup-piper) |
+| `hassio_role: manager` | −1 (needed for addon mgmt) |
+| AppArmor profile (v0.9.44) | **+1** |
+| ~~CodeNotary~~ | n/a (project dead) |
+
+Ceiling for this add-on at v0.9.48: **~6 or 7** depending on HA's
+exact algorithm. To raise further, the only remaining lever is
+downgrading `hassio_role` from `manager` to `default`, which loses
+the `/api/admin/addons` + auto-setup-piper / reset-piper endpoints.
+
+### Secrets cleanup
+
+The `CN_USER` + `CN_PASSWORD` GitHub repo secrets you added in v0.9.45
+are now unreferenced — harmless if left, free to delete at
+https://github.com/tesseractAZ/ecoflow-panel/settings/secrets/actions.
+Likewise the CodeNotary account itself.
+
 ## 0.9.47 — 2026-05-26
 
 **Fix: install vcn natively (CodeNotary signing on aarch64).** v0.9.46
