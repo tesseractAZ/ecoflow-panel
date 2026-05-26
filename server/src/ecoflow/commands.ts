@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { ecoflow } from './rest.js';
 import { appendWriteLog, type WriteOutcome } from '../writeLog.js';
 
@@ -170,5 +171,22 @@ export function isWriteDebugEnabled(): boolean {
 
 export function checkWriteDebugToken(provided: string | undefined): boolean {
   const expected = process.env.WRITE_DEBUG_TOKEN;
-  return !!expected && !!provided && expected === provided;
+  if (!expected || !provided) return false;
+  // v0.9.62 — constant-time compare. The previous `===` short-circuits on
+  // the first mismatched byte, leaking token-prefix-length via timing on a
+  // (theoretically) attacker-on-LAN scenario. timingSafeEqual requires
+  // equal-length buffers; for unequal lengths we still need to compare
+  // against SOMETHING the same shape so the duration stays constant
+  // regardless of how close the provided value's length is to the real one.
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(provided, 'utf8');
+  if (a.length !== b.length) {
+    // Hash both into a fixed-shape scratch buffer to keep the compare cost
+    // independent of input length — but still return false (length mismatch
+    // ⇒ definitely not equal). The scratch compare just normalizes timing.
+    const scratch = Buffer.alloc(a.length);
+    timingSafeEqual(a, scratch);
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
