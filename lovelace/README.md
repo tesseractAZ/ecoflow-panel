@@ -7,7 +7,7 @@ add-on. Pick one or use several:
 |---|---|
 | `custom:ecoflow-panel-card` | Compact stats glance — 12 headline numbers in a single panel |
 | `custom:ecoflow-panel-dashboard` (v0.9.4) | Multi-tab interface — Dashboard / Battery / Forecast / Alerts |
-| `custom:ecoflow-fleet-card` (early dev) | First card in the new Lit-based rewrite — scaffold only |
+| `custom:ecoflow-fleet-card` (early dev) | First card in the new Lit-based rewrite — live status + counts (PR2) |
 
 For the deepest analytics (interactive charts, per-cell voltage,
 strategy config) the PWA at `:8787` remains the full surface — both
@@ -18,23 +18,47 @@ cards have an **Open full dashboard** button.
 A new generation of cards is being built on [Lit](https://lit.dev),
 written in TypeScript, sharing a single WebSocket connection to the
 add-on per host. They live under `src/` and build into `dist/` via
-Rollup. The first card, `custom:ecoflow-fleet-card`, currently renders
-only a placeholder — the snapshot store is stubbed and full data
-plumbing arrives in a follow-up. The legacy
-`custom:ecoflow-panel-card` and `custom:ecoflow-panel-dashboard`
-remain the production cards and are unaffected by the new build.
+Rollup. The legacy `custom:ecoflow-panel-card` and
+`custom:ecoflow-panel-dashboard` remain the production cards and are
+unaffected by the new build.
+
+**PR2 — shared infrastructure (current)**
+
+The fleet card now renders real data: connection-state badge plus
+device/online/alert counts, driven by:
+
+- **Snapshot store** (`src/shared/snapshot-store.ts`) — per-host
+  refcounted singleton; opens a WebSocket on first subscribe,
+  REST-seeds from `/api/snapshot`, reconnects with 1/2/4/8/16/30 s
+  exponential backoff, and tears down 5 s after the last unsubscribe
+  so dashboard tab switches don't churn the connection.
+- **Primitives** (`src/shared/primitives/`) — `<ef-badge>`,
+  `<ef-tile>`, `<ef-section>` — small LitElements styled off the
+  `--ef-*` design tokens.
+- **Glossary directive** (`src/shared/glossary.ts`) — Shadow-DOM-safe
+  rewrite of the React-era hover-tooltip pass; call `glossary('soc')`
+  inside any `html\`\`` template.
+- **Ports** — `alerts.ts` and `sort.ts` copied verbatim from
+  `web/src/`; pure data, no React.
+
+The full fleet visuals (EnergyFlow SVG, forecast chart) land in PR3+.
 
 Building locally:
 
 ```bash
 cd lovelace
 npm install
-npm run build       # writes dist/ecoflow-fleet-card.js
+npm run build       # writes dist/ecoflow-fleet-card.js + test bundle
 npm run type-check  # tsc --noEmit
 ```
 
 Built bundles are committed to `dist/` so HACS can serve them
 directly without a build step on the user's machine.
+
+**Tests** — `test/snapshot-store.test.html` loads
+`dist/snapshot-store.test.js` and runs five vanilla-JS cases against
+a stubbed `WebSocket` (subscribe, refcount, reconnect, grace,
+getSnapshot). Open the HTML file in a browser after `npm run build`.
 
 ## Stats card (`custom:ecoflow-panel-card`)
 
