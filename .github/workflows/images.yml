@@ -156,71 +156,11 @@ jobs:
           cache-from: type=gha,scope=ecoflow-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=ecoflow-${{ matrix.arch }},ignore-error=true
 
-      # v0.9.45 — CodeNotary image signing. Gated on both CN_USER and
-      # CN_PASSWORD secrets being present in the GitHub repo. If either
-      # is missing, the step is skipped without failing — so the workflow
-      # works fine BEFORE the user sets up CodeNotary, and starts signing
-      # automatically the next push after they do.
-      #
-      # `build.yaml` declares the expected signer (epaschal@outlook.com); the
-      # secrets must match that identity. HA Supervisor verifies the
-      # signature on pull — a mismatch aborts the install.
-      - name: Check CodeNotary secrets
-        id: cn_check
-        env:
-          CN_USER: ${{ secrets.CN_USER }}
-          CN_PASSWORD: ${{ secrets.CN_PASSWORD }}
-        run: |
-          if [ -n "$CN_USER" ] && [ -n "$CN_PASSWORD" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "CodeNotary secrets present — will sign images."
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "CodeNotary secrets MISSING — skipping signing. To enable:"
-            echo "  1. Register CodeNotary at https://www.codenotary.io with epaschal@outlook.com"
-            echo "  2. Add CN_USER (= epaschal@outlook.com) and CN_PASSWORD secrets"
-            echo "     at https://github.com/${{ github.repository }}/settings/secrets/actions"
-          fi
-
-      # v0.9.47 — Install vcn natively per-arch. The previous version used
-      # `docker run codenotary/vcn:latest` which only publishes an amd64
-      # image; on our aarch64 runner (ubuntu-24.04-arm) Docker fell back
-      # to QEMU emulation and the Go binary SIGSEGV'd in netpoll on
-      # startup. CodeNotary ships native arm64/amd64 binaries on their
-      # GitHub releases page, so install one directly.
-      - name: Install vcn
-        if: steps.cn_check.outputs.configured == 'true'
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)  VCN_ARCH=amd64 ;;
-            aarch64) VCN_ARCH=arm64 ;;
-            *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
-          esac
-          VCN_VERSION=v0.9.13
-          curl -fsSL -o /tmp/vcn \
-            "https://github.com/codenotary/vcn/releases/download/${VCN_VERSION}/vcn-${VCN_VERSION}-linux-${VCN_ARCH}-static"
-          sudo install -m 0755 /tmp/vcn /usr/local/bin/vcn
-          vcn --version
-
-      - name: Sign image with CodeNotary
-        if: steps.cn_check.outputs.configured == 'true'
-        env:
-          VCN_USER: ${{ secrets.CN_USER }}
-          VCN_PASSWORD: ${{ secrets.CN_PASSWORD }}
-          VCN_NOTARIZATION_PASSWORD: ${{ secrets.CN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Authenticate to CodeNotary (writes session token to ~/.vcn).
-          vcn login
-          IMG_VER="ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.arch }}-ecoflow-panel:${{ needs.resolve.outputs.version }}"
-          IMG_LATEST="ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.arch }}-ecoflow-panel:latest"
-          for IMG in "$IMG_VER" "$IMG_LATEST"; do
-            echo "::group::vcn notarize $IMG"
-            vcn notarize --silent --output json "docker://$IMG" \
-              | tee "/tmp/vcn-$(basename "$IMG" | tr ':' '-').json"
-            echo "::endgroup::"
-          done
+      # v0.9.48 — CodeNotary signing steps REMOVED. See build.yaml for
+      # the postmortem. tl;dr: vcn OSS project is dead, HA Supervisor
+      # rating ceiling for us is now ~7 (with v0.9.44 AppArmor profile).
+      # CN_USER + CN_PASSWORD secrets are harmless if left in the repo;
+      # nothing references them.
 
   release:
     name: Cut GitHub Release
