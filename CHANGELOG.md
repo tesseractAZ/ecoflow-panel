@@ -3,6 +3,72 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.51 — 2026-05-26
+
+**HACS Lit port PR2: shared infrastructure.** Lands the foundation that
+PR3-6 (the actual cards) all build on. No user-visible feature yet —
+the fleet card still renders a "live/connecting" status block — but
+every primitive needed for the upcoming card ports is now in place.
+
+### New shared modules (`lovelace/src/shared/`)
+
+- **`snapshot-store.ts`** — real WebSocket client (PR1 stub replaced).
+  - Refcounted per-host singleton. First subscriber opens the WS, last
+    unsubscribe closes it after a 5-sec grace period (so navigating
+    between cards on the same dashboard doesn't churn the connection).
+  - On open: REST seed via `/api/snapshot` (so cards mounted before
+    the first WS push still render) + subscribe to `{type:'snapshot'}`
+    push messages.
+  - On close/error: exponential backoff reconnect (1/2/4/8/16/30 s).
+    Resets to 1 s on successful open.
+  - 5-state machine: idle / connecting / open / reconnecting / closed.
+- **`alerts.ts`, `sort.ts`** — verbatim ports from `web/src/`
+  (utilities for severity ordering, dedup, device sort comparators).
+- **`glossary.ts`** — terms dictionary + `glossary(label)` Lit
+  directive. Survives Shadow DOM (the React app's MutationObserver
+  approach doesn't, so this was a re-implementation, not a copy).
+- **`primitives/`** — three small reusable LitElements:
+  - `<ef-badge tone="ok|warn|bad|info">` — slotted chip
+  - `<ef-tile label value unit>` — labeled stat
+  - `<ef-section title>` — bordered card subsection with header slot
+
+### Test infrastructure (also new)
+
+- `lovelace/test/snapshot-store.test.ts` — 5 vanilla-JS tests against
+  a `FakeWebSocket`: subscribe / unsubscribe / refcount / reconnect /
+  grace-period teardown.
+- `lovelace/test/snapshot-store.test.html` — browser harness loading
+  the built test bundle.
+- `rollup.config.mjs` extended with a non-minified ESM test bundle so
+  the test HTML can `import` the module path.
+
+### Theme additions (`theme.css.ts`)
+
+New tokens for the glossary tooltip + info-tone badge:
+`--ef-info`, `--ef-tooltip-bg`, `--ef-tooltip-fg`, `--ef-tooltip-shadow`.
+
+### Bundle size
+
+`dist/ecoflow-fleet-card.js`: 19.5 KB → 27.2 KB (+7.7 KB). Reflects the
+real store + 3 primitives + theme additions + richer render.
+
+### What PR3-6 now has unblocked
+
+- Any card can `extend EcoflowCardBase` to inherit config + auto-
+  subscribed snapshot.
+- Multiple cards on the same dashboard share ONE WebSocket per host.
+- `<ef-badge>` / `<ef-tile>` / `<ef-section>` compose into consistent
+  visual language without each card reinventing CSS.
+- `glossary('SoH')` works inside Shadow DOM — every card can wrap
+  jargon labels without DOM-walking hacks.
+- `sortDevices()`, `alertCounts()` ready for per-device and
+  alerts-tab views.
+
+### Status
+
+PR3 (fleet card) and PR4 (alerts card) are in-flight on parallel
+background agents. Will ship as separate releases once each lands.
+
 ## 0.9.50 — 2026-05-26
 
 **Lovelace devDep: serialize-javascript override (CVE fix).** The

@@ -5,16 +5,18 @@ import terser from '@rollup/plugin-terser';
 const isDev = process.env.NODE_ENV === 'development';
 
 /**
- * One config per card so each bundle tree-shakes independently.
- * Output goes ONLY to the new file names — legacy
- * dist/ecoflow-panel-card.js and dist/ecoflow-panel-dashboard.js
- * are NOT touched.
+ * One bundle per card plus the standalone test harness. Each card bundle
+ * tree-shakes independently — primitives that aren't used in a card don't
+ * bloat its output. Output goes ONLY to the new file names; legacy
+ * dist/ecoflow-panel-card.js and dist/ecoflow-panel-dashboard.js are NOT
+ * touched.
+ *
+ * The test bundle is ESM (not IIFE) so it can do `import` inside the
+ * browser test harness; it's not minified so failures are readable.
  */
-const cards = [
+const cardBundles = [
   { input: 'src/cards/fleet-card.ts', output: 'dist/ecoflow-fleet-card.js', name: 'EcoflowFleetCard' },
-];
-
-export default cards.map(({ input, output, name }) => ({
+].map(({ input, output, name }) => ({
   input,
   output: {
     file: output,
@@ -26,9 +28,26 @@ export default cards.map(({ input, output, name }) => ({
     nodeResolve(),
     typescript({
       tsconfig: './tsconfig.json',
-      // rollup-emit overrides tsconfig noEmit
       compilerOptions: { noEmit: false },
     }),
     ...(isDev ? [] : [terser()]),
   ],
 }));
+
+const testBundle = {
+  input: 'test/snapshot-store.test.ts',
+  output: {
+    file: 'dist/snapshot-store.test.js',
+    format: 'es',
+    sourcemap: true,
+  },
+  plugins: [
+    nodeResolve(),
+    typescript({
+      tsconfig: './tsconfig.json',
+      compilerOptions: { noEmit: false },
+    }),
+  ],
+};
+
+export default [...cardBundles, testBundle];
