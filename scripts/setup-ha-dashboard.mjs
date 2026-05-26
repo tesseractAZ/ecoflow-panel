@@ -2,16 +2,18 @@
 /**
  * v0.9.55 — One-shot HA dashboard installer for the EcoFlow Panel cards.
  *
- * Decoupled sources by design:
- *   - **Card JS modules** load from jsdelivr's GitHub mirror, pinned to a
- *     git tag. Jsdelivr serves with `Cache-Control: immutable` and the
- *     correct CORS + MIME headers, so HA can `import()` them from any
- *     origin without browser blocking. No add-on update needed for the
- *     dashboard to render — handy when the add-on is installed from
- *     `local` source (Supervisor can't auto-update those from GHCR).
- *   - **Data** comes from the add-on at `http://<host>:8787`. Each card's
- *     `host:` config points here for `/api/snapshot`, WebSocket stream,
- *     `/api/history`, etc.
+ * Sources:
+ *   - **Card JS modules** load by default from the add-on at
+ *     `http://<host>:8787/lovelace/<card>.js` (v0.9.55+ self-serves the
+ *     `lovelace/dist/` bundles with CORS, so a dashboard at :8123 can
+ *     fetch them cross-origin). Off-grid friendly — no internet hop on
+ *     HA reload. For setups that can't ship the latest add-on, override
+ *     `RESOURCE_BASE` to point at jsdelivr's tagged mirror:
+ *     `https://cdn.jsdelivr.net/gh/tesseractAZ/ecoflow-panel@v0.9.55/lovelace/dist`.
+ *   - **Data** also comes from the add-on at `http://<host>:8787` — each
+ *     card's `host:` config is hardcoded to ADDON_HOST for the
+ *     `/api/snapshot` REST seed, the live WebSocket stream, and
+ *     `/api/history` lookups.
  *
  * What this script does, via HA's authenticated WebSocket API:
  *   1. Verifies the chosen RESOURCE_BASE serves a real JS bundle for each
@@ -45,9 +47,11 @@ import WebSocket from '../server/node_modules/ws/wrapper.mjs';
 const HA_TOKEN = process.env.HA_TOKEN;
 const HA_HOST = process.env.HA_HOST ?? 'homeassistant.local:8123';
 const ADDON_HOST = process.env.ADDON_HOST ?? 'http://homeassistant.local:8787';
-const RESOURCE_BASE =
-  process.env.RESOURCE_BASE ??
-  'https://cdn.jsdelivr.net/gh/tesseractAZ/ecoflow-panel@v0.9.55/lovelace/dist';
+// Default to the add-on's self-served bundles (v0.9.55+ ships `/lovelace/*`).
+// Off-grid friendly — no internet round-trip when HA reloads the resource.
+// Fallback for users who can't run the latest add-on: set RESOURCE_BASE to
+// `https://cdn.jsdelivr.net/gh/tesseractAZ/ecoflow-panel@v0.9.55/lovelace/dist`.
+const RESOURCE_BASE = process.env.RESOURCE_BASE ?? `${ADDON_HOST}/lovelace`;
 // HA's lovelace/dashboards/create requires a hyphen in url_path. Use one.
 const DASHBOARD_PATH = process.env.DASHBOARD_PATH ?? 'ecoflow-dashboard';
 const DASHBOARD_TITLE = process.env.DASHBOARD_TITLE ?? 'EcoFlow';
@@ -157,6 +161,21 @@ async function ensureResources(ws) {
   console.log('\nReconciling Lovelace resources…');
   const existing = await send(ws, { type: 'lovelace/resources' });
   const wanted = new Set(CARDS.map(({ slug }) => `${RESOURCE_BASE}/${slug}.js`));
+  // A registered resource is "ours" if its URL ends with `/ecoflow-<one of
+  // our slugs>.js`, regardless of host. Anything matching that pattern but
+  // not pointing at the current RESOURCE_BASE is a leftover from a previous
+  // setup (e.g. an earlier jsdelivr install before migrating to the add-on
+  // self-serve) and gets deleted before we register the new ones.
+  const ourSlugs = new Set(CARDS.map(({ slug }) => slug));
+  const slugFromUrl = (url) => {
+    const m = url.match(/\/([a-z0-9-]+)\.js(?:\?.*)?$/);
+    return m && ourSlugs.has(m[1]) ? m[1] : null;
+  };
+  const stale = existing.filter((r) => slugFromUrl(r.url) && !wanted.has(r.url));
+  for (const r of stale) {
+    await send(ws, { type: 'lovelace/resources/delete', resource_id: r.id });
+    console.log(`  - deleted stale  ${r.url}`);
+  }
   const already = new Set(existing.filter((r) => wanted.has(r.url)).map((r) => r.url));
   for (const url of wanted) {
     if (already.has(url)) {
