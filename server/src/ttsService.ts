@@ -545,7 +545,16 @@ export async function speakWithFallback(
   const attempts: Array<{ engine: TtsEngine; error: string | null }> = [];
   let lastResult: ServiceCallResult = { ok: false, status: 0, error: 'no engines tried' };
   for (const eng of engines) {
-    const r = await speakAnnouncement(message, { ...opts, engine: eng });
+    // v0.9.38 — single-attempt with 1.5-sec retry on 500. Production testing
+    // showed that TTS service calls right after MA klaxon announcements can
+    // return 500 even when the engine works standalone (MA's restore phase
+    // collides with new TTS commands). One quick retry usually catches the
+    // narrow window where MA hasn't fully released the speakers yet.
+    let r = await speakAnnouncement(message, { ...opts, engine: eng });
+    if (!r.ok && r.status === 500) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      r = await speakAnnouncement(message, { ...opts, engine: eng });
+    }
     if (r.ok) {
       attempts.push({ engine: eng, error: null });
       return { result: r, engineUsed: eng, attempts };
