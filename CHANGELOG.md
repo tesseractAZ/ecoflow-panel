@@ -3,6 +3,80 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.52 — 2026-05-26
+
+**HACS Lit port PR3+PR4: fleet card + alerts card.** Two of four
+remaining card ports landed together. With v0.9.51's shared
+infrastructure in place, both cards were ported in parallel by
+focused implementation agents and pass type-check + build.
+
+### `<ecoflow-fleet-card>` (PR3, the marquee card)
+
+Replaces the PR2 hello-world stub with a full Dashboard-tab port —
+~70% of daily-glance dashboard value in one card. Single
+`EcoflowFleetCard` class, render sharded into private methods:
+
+- **`renderStatusBanner()`** — tone-tinted alert ribbon (green ok /
+  amber warning / red critical) listing first 4 actionable alerts
+- **`renderEnergyFlow()`** — animated SVG: PV → batteries → grid →
+  loads with flowing dash marks (recharts replaced with CSS
+  `@keyframes`, period scales with watts)
+- **`renderTopRow()`** — runway hours + today kWh tiles
+- **`renderDeviceGrid()`** — SHP2 first (backup %, top circuits,
+  source slots), then DPUs in Core 1..N order, then small
+  EcoFlow devices (Delta Pro 3 / RIVER 3 Plus / etc.) in "Other"
+- **`renderForecast()`** — 24h PV projection chart using new
+  `forecastChart()` from `src/shared/charts.ts`
+
+**New shared module:** `src/shared/charts.ts` (196 lines) ships
+`sparkline()` and `forecastChart()` SVG renderers, returning Lit
+`TemplateResult`. Hand-rolled to avoid recharts (React-only, 70 KB
+gzip cost). Designed for reuse by PR5 (battery) + PR6 (solar).
+
+**Bundle:** 27.2 KB → **59.7 KB** minified (under 60 KB cap).
+
+**Three HTTP endpoints** polled on `config.refresh_seconds` (30 s
+default): `/api/runway`, `/api/summary/today`, `/api/forecast`. Each
+cached in `@state` with a `stale-data` badge fallback on error.
+
+### `<ecoflow-alerts-card>` (PR4, the focused-task card)
+
+`EcoflowAlertsCard` extends `EcoflowCardBase`. ~570 lines, **51.8 KB**
+minified (Lit runtime + glossary dict dominate; per-card overhead is
+~30 KB once amortized across multiple cards on the same dashboard
+sharing a single WS).
+
+- **Active alerts** from `snapshot.alerts` (no extra fetch — already
+  in snapshot stream)
+- **Cleared alerts** lazily fetched from `/api/alerts/history?limit=20`
+  on user expand
+- **Predictive insights** derived in-card by
+  `source === 'learned' || id.startsWith('forecast-')` — mirrors
+  `web/src/pages/PredictiveInsights.tsx` logic
+- **Outcome buttons** (Ack / Dismiss / Failed) — optimistic remove
+  on click, restore on POST failure with inline error chip
+- **Notify status** fetched on `connectedCallback`; `/api/notify/test`
+  POST behind a Test button with idle/sending/ok/fail state machine
+
+### Other touches
+
+- `lovelace/rollup.config.mjs` — appended `alerts-card` entry
+- `lovelace/dev/index.html` — both cards mounted; shared setup helper
+  reuses the single WS (PR2 refcounting at work)
+- `lovelace/README.md` — both new cards documented in the cards table
+  with install snippets
+
+### What's running NOW
+
+PR5 (`ecoflow-battery-card` — ThermalPanel + DegradationCard) and
+PR6 (`ecoflow-solar-card` + cleanup) dispatched to parallel
+background agents. Will ship as v0.9.53 once both complete (or
+separately if one races ahead).
+
+After PR6 lands, the port is "feature complete" for v1.0.0 — the
+deferred items (EvsePanel, StrategyPanel, AdvancedInsightsCard,
+CircuitModal) remain accessible via the PWA.
+
 ## 0.9.51 — 2026-05-26
 
 **HACS Lit port PR2: shared infrastructure.** Lands the foundation that

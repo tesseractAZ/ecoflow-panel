@@ -23,31 +23,39 @@
   </head>
   <body>
     <h1>EcoFlow Card Dev</h1>
-    <p>Loads dist/ecoflow-fleet-card.js for local testing.</p>
+    <p>Loads each card bundle so they can be tested side-by-side. The
+    snapshot store is shared per host — DevTools → Network → WS should
+    show a SINGLE connection across both cards.</p>
+    <h2>Fleet</h2>
     <ecoflow-fleet-card></ecoflow-fleet-card>
+    <h2>Alerts</h2>
+    <ecoflow-alerts-card></ecoflow-alerts-card>
     <script type="module" src="../dist/ecoflow-fleet-card.js"></script>
+    <script type="module" src="../dist/ecoflow-alerts-card.js"></script>
     <script>
-      // The bundle is IIFE — register the custom element synchronously on load.
-      // Assign config after the element is upgraded.
-      window.addEventListener('load', () => {
-        const el = document.querySelector('ecoflow-fleet-card');
+      // Both bundles are IIFE — wait until the element is upgraded then
+      // setConfig(). The whenDefined() path covers slow upgrades; the
+      // direct call covers the case where the element is already ready.
+      const setup = (tag, cfg) => {
+        const apply = (el) => el.setConfig(cfg);
+        const el = document.querySelector(tag);
         if (el && typeof el.setConfig === 'function') {
-          el.setConfig({
-            type: 'custom:ecoflow-fleet-card',
-            host: 'http://homeassistant.local:8787',
-            title: 'EcoFlow Fleet',
-          });
+          apply(el);
         } else {
-          // Custom element not upgraded yet — wait for it.
-          customElements.whenDefined('ecoflow-fleet-card').then(() => {
-            const e = document.querySelector('ecoflow-fleet-card');
-            e.setConfig({
-              type: 'custom:ecoflow-fleet-card',
-              host: 'http://homeassistant.local:8787',
-              title: 'EcoFlow Fleet',
-            });
-          });
+          customElements.whenDefined(tag).then(() => apply(document.querySelector(tag)));
         }
+      };
+      window.addEventListener('load', () => {
+        setup('ecoflow-fleet-card', {
+          type: 'custom:ecoflow-fleet-card',
+          host: 'http://homeassistant.local:8787',
+          title: 'EcoFlow Fleet',
+        });
+        setup('ecoflow-alerts-card', {
+          type: 'custom:ecoflow-alerts-card',
+          host: 'http://homeassistant.local:8787',
+          title: 'EcoFlow Alerts',
+        });
       });
     </script>
   </body>
