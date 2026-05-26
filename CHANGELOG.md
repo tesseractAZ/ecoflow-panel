@@ -3,6 +3,57 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.38 — 2026-05-26
+
+**Klaxon → TTS timing fix.** v0.9.37 production testing turned up a
+nasty surprise: TTS engines that worked perfectly **standalone** (via
+`/api/broadcast/test-tts`) failed with **500** when called inside the
+broadcast pipeline, immediately after the MA klaxon.
+
+The bisection went:
+- ✅ Piper standalone → tested via test-tts (separately diagnosed
+  Piper as misconfigured, but that's a separate issue)
+- ✅ Cloud standalone → 200 to 1 HomePod, 200 to all 6 speakers
+- ❌ Full broadcast (klaxon + TTS via fallback chain) → 500 on Piper,
+  500 on Cloud, no spoken alert
+
+The difference: in the broadcast, MA's `play_announcement` had just
+fired the klaxon. MA holds the speakers in announcement-mode for
+several seconds AFTER the audio WAV ends (queue restore, volume
+restore, per-protocol cleanup). The v0.9.30 hard-coded 3500ms settle
+for red wasn't enough — `tts.speak` collided with MA's still-running
+cleanup and HA returned 500.
+
+### Fixes
+
+- **Klaxon settle** bumped from 3500ms → **7500ms** for red, 1800ms →
+  **4500ms** for yellow/green. Brief silence between klaxon and voice
+  beats losing the voice entirely.
+- **One quick retry on TTS 500.** `speakWithFallback` now retries the
+  same engine once after 1.5 sec when the call returns 500 (likely an
+  MA-restore race). Then if still failing, moves to the next engine.
+
+Combined, these mean a typical red-alert broadcast plays:
+
+```
+t=0 ms      airplay (HomePods) klaxon starts
+t=1000 ms   cast group klaxon starts
+t=1700 ms   sonos klaxon starts
+t≈4000 ms   all klaxons settle, MA cleanup begins
+t=7500 ms   TTS "Red alert. Red alert. ..." starts on all speakers
+```
+
+Net round-trip ~10 sec for a critical alert. Slightly longer than
+v0.9.30, but reliably ends in spoken content instead of silence.
+
+### Note on Piper
+
+Diagnosis via test-tts confirmed Piper's `tts.piper` entity exists but
+`state: unknown` — no voice model loaded. To fix Piper specifically:
+HA → Settings → Add-ons → Piper → Configuration → pick a voice
+(e.g. `en_US-amy-medium`) → Save → Restart. Until then, the fallback
+chain falls through Piper to Cloud, which now works.
+
 ## 0.9.37 — 2026-05-26
 
 **Hotfix: GHA buildx cache reliability.** v0.9.35-36 image publishes

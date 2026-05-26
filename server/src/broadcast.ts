@@ -434,15 +434,23 @@ export function startBroadcastMonitor(
     }));
 
     // After the klaxon: fire TTS announcement if available + requested.
-    // We wait klaxon-duration (~3 sec for red, ~1.5 for yellow/green)
-    // before speaking so the operator isn't trying to parse speech over
-    // a beeping klaxon.
+    // v0.9.38 — increased settle time from 3500ms → 7500ms for red, 1800ms →
+    // 4500ms for yellow/green. Production testing (v0.9.37) showed that
+    // even when TTS engines worked standalone (verified via test-tts), they
+    // returned 500 when called RIGHT after MA's klaxon announcement. The
+    // root cause: MA's play_announcement holds the speakers in announcement-
+    // mode for several seconds after the audio WAV ends (queue restore +
+    // volume restore + per-protocol cleanup). Hitting tts.speak during this
+    // window collides with MA's cleanup → HA returns 500.
+    //
+    // Empirical: 7.5 sec covers the MA settle window for AirPlay/Sonos/Cast
+    // groups in our 6-speaker setup. The user might briefly hear the klaxon
+    // ending before the spoken announcement starts — preferable to losing
+    // the spoken announcement entirely.
     //
     // v0.9.31 — use speakWithFallback: if the preferred engine 500s, try
     // the next-best detected engine instead of dropping the announcement.
-    // Field log showed tts.cloud_say returning 500 intermittently in
-    // v0.9.30; this makes the TTS path resilient to single-engine flakes.
-    const klaxonSettleMs = level === 'red' ? 3500 : 1800;
+    const klaxonSettleMs = level === 'red' ? 7500 : 4500;
     if (message && ttsEngine) {
       await sleep(klaxonSettleMs);
       // Build the engine list: preferred first, then the rest of the
