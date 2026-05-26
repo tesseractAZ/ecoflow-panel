@@ -8,6 +8,7 @@ add-on. Pick one or use several:
 | `custom:ecoflow-panel-card` | Compact stats glance — 12 headline numbers in a single panel |
 | `custom:ecoflow-panel-dashboard` (v0.9.4) | Multi-tab interface — Dashboard / Battery / Forecast / Alerts |
 | `custom:ecoflow-fleet-card` (early dev) | First card in the new Lit-based rewrite — live status + counts (PR2) |
+| `custom:ecoflow-alerts-card` (early dev) | Active + cleared alerts, predictive insights, notify controls (PR4) |
 
 For the deepest analytics (interactive charts, per-cell voltage,
 strategy config) the PWA at `:8787` remains the full surface — both
@@ -43,12 +44,35 @@ device/online/alert counts, driven by:
 
 The full fleet visuals (EnergyFlow SVG, forecast chart) land in PR3+.
 
+**PR4 — alerts card (current)**
+
+`custom:ecoflow-alerts-card` renders the live alerts list, lazy-loaded
+cleared history, predictive-insights subset, and notify controls. Each
+active alert gets Ack / Dismiss / Failed buttons that POST to
+`/api/alerts/outcome` — the feedback loop feeding the learned-risk
+model. Empty state is a friendly "No active alerts" with a green tick.
+Built independently of PR3 (`fleet-card`); both share the per-host
+snapshot WS via the shared store.
+
+Add it to a dashboard alongside the fleet card:
+
+```yaml
+type: 'custom:ecoflow-alerts-card'
+host: http://homeassistant.local:8787
+title: Alerts
+```
+
+Manual install (no HACS): copy `dist/ecoflow-alerts-card.js` to
+`<config>/www/` and add a JavaScript-Module resource for it. HACS users
+can keep using the legacy `ecoflow-panel-card.js` entry while the new
+cards stabilize — each card is a self-contained file under `dist/`.
+
 Building locally:
 
 ```bash
 cd lovelace
 npm install
-npm run build       # writes dist/ecoflow-fleet-card.js + test bundle
+npm run build       # writes dist/ecoflow-{fleet,alerts}-card.js + test bundle
 npm run type-check  # tsc --noEmit
 ```
 
