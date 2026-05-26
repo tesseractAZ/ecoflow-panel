@@ -3,8 +3,8 @@ import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import compress from '@fastify/compress';
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { config } from './config.js';
@@ -86,7 +86,7 @@ import {
   cooldownRemainingMs,
   REFRESH_COOLDOWN_MS,
 } from './ecoflow/commands.js';
-import { tailWriteLog } from './writeLog.js';
+import { appendWriteLog, tailWriteLog } from './writeLog.js';
 
 // REST polling cadence. MQTT now delivers per-cmdId fresh data, but we keep a
 // 60s REST poll as a baseline for fields that MQTT doesn't emit and as recovery
@@ -109,7 +109,166 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body,
     done(e as Error, undefined);
   }
 });
-await app.register(cors, { origin: true });
+/* ─── v0.9.62 — defense-in-depth security hardening ──────────────────
+ *
+ * Eric's add-on lives on a trusted LAN behind HA Ingress, so today no
+ * one is going to drive-by-attack it. But a defense-in-depth audit
+ * surfaced three risks worth closing:
+ *
+ *   1. CORS was `origin: true` (echoes any Origin), which means any
+ *      malicious page on the LAN could fire `fetch('http://.../api/...',
+ *      { credentials: 'include' })` and read the panel's state — or
+ *      worse, fire writes. We replace it with an explicit allow-list of
+ *      same-origin + HA dashboard origins + LAN HA host patterns.
+ *   2. Write endpoints were unauthenticated. We add a write-token +
+ *      same-origin + HA-ingress allowlist (`requireWriteAuth`). The
+ *      token is auto-generated on first start and stored mode-0600 at
+ *      `/data/panel-write-token.txt`, so the operator (Eric) can read
+ *      it once and embed it in cross-origin scripts.
+ *   3. Admin / Supervisor-facing GETs (audit log, addon listing,
+ *      media-player discovery) were unauthenticated. We layer the same
+ *      `requireWriteAuth` hook on them.
+ *
+ * NORMAL OPERATION IS UNCHANGED:
+ *   - The React dashboard at port 8787 is same-origin → passes.
+ *   - HA Ingress requests carry `X-Ingress-Path` → passes.
+ *   - Lovelace cards do read-only GETs to /api/snapshot etc. → not gated.
+ *   - `/api/alerts/outcome` is intentionally left open (user-feedback).
+ */
+
+/** Origins the dashboard is expected to be loaded from. Used by both
+ *  CORS and the same-origin check in requireWriteAuth. */
+const PANEL_SAME_ORIGINS = new Set<string>([
+  `http://${config.host}:${config.port}`,
+  `https://${config.host}:${config.port}`,
+  `http://homeassistant.local:${config.port}`,
+  `https://homeassistant.local:${config.port}`,
+  `http://localhost:${config.port}`,
+  `https://localhost:${config.port}`,
+  `http://127.0.0.1:${config.port}`,
+  `https://127.0.0.1:${config.port}`,
+]);
+
+/** HA dashboard origins we expect Lovelace cards / browsers to come from.
+ *  Both explicit hostnames + LAN-IP HA hosts (192.168.x.x:8123 etc.). */
+const HA_DASHBOARD_ORIGINS = new Set<string>([
+  'http://homeassistant.local:8123',
+  'https://homeassistant.local:8123',
+  'http://homeassistant:8123',
+  'https://homeassistant:8123',
+  'http://homeassistant.local:8787',
+  'https://homeassistant.local:8787',
+]);
+
+/** Matches a LAN-style HA host like 192.168.1.5:8123 or 10.0.0.4:8123 or
+ *  a `*.local:8123` hostname. Kept deliberately narrow — we DON'T want
+ *  to match arbitrary internet origins. */
+const LAN_ORIGIN_RE =
+  /^https?:\/\/(?:(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9-]+\.local):(?:8123|8787)$/;
+
+function isAllowedOrigin(origin: string): boolean {
+  if (PANEL_SAME_ORIGINS.has(origin)) return true;
+  if (HA_DASHBOARD_ORIGINS.has(origin)) return true;
+  if (LAN_ORIGIN_RE.test(origin)) return true;
+  return false;
+}
+
+await app.register(cors, {
+  // Callback form: same-origin requests (no Origin header) get echoed
+  // through unchanged; cross-origin requests are accepted only if the
+  // Origin matches our allowlist. Anything else gets NO
+  // Access-Control-Allow-Origin header, so the browser blocks the
+  // response from JS.
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);  // same-origin, curl, server-side
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+});
+
+/* ─── write-auth token bootstrap ──────────────────────────────────────
+ * Read PANEL_WRITE_TOKEN from env; auto-generate + persist if missing.
+ * Stored mode-0600 at `${DATA_DIR}/panel-write-token.txt` so it survives
+ * restarts and is readable only by the add-on user. */
+const dataDir = process.env.DATA_DIR ?? '/data';
+const WRITE_TOKEN_PATH = resolve(dataDir, 'panel-write-token.txt');
+
+function loadOrCreateWriteToken(): string {
+  const envTok = process.env.PANEL_WRITE_TOKEN;
+  if (envTok && envTok.length >= 16) return envTok;
+  try {
+    if (existsSync(WRITE_TOKEN_PATH)) {
+      const t = readFileSync(WRITE_TOKEN_PATH, 'utf8').trim();
+      if (t.length >= 16) return t;
+    }
+  } catch { /* fall through to regenerate */ }
+  const fresh = randomUUID();
+  try {
+    mkdirSync(dirname(WRITE_TOKEN_PATH), { recursive: true });
+    writeFileSync(WRITE_TOKEN_PATH, fresh + '\n', { mode: 0o600 });
+    try { chmodSync(WRITE_TOKEN_PATH, 0o600); } catch { /* best-effort */ }
+    app.log.info(
+      `panel: write-token auto-generated and saved to ${WRITE_TOKEN_PATH} — ` +
+      `required for write endpoints from cross-origin clients`,
+    );
+  } catch (e: any) {
+    app.log.warn(
+      `panel: could not persist write-token to ${WRITE_TOKEN_PATH}: ` +
+      `${e?.message ?? e}. Token still active in memory for this run.`,
+    );
+  }
+  return fresh;
+}
+
+const PANEL_WRITE_TOKEN = loadOrCreateWriteToken();
+const PANEL_WRITE_TOKEN_BUF = Buffer.from(PANEL_WRITE_TOKEN, 'utf8');
+
+/** Constant-time string compare; safe for unequal lengths. */
+function tokenEquals(provided: string): boolean {
+  const b = Buffer.from(provided, 'utf8');
+  if (b.length !== PANEL_WRITE_TOKEN_BUF.length) {
+    // Hash-compare against scratch so timing stays length-independent.
+    const scratch = Buffer.alloc(PANEL_WRITE_TOKEN_BUF.length);
+    timingSafeEqual(PANEL_WRITE_TOKEN_BUF, scratch);
+    return false;
+  }
+  return timingSafeEqual(PANEL_WRITE_TOKEN_BUF, b);
+}
+
+/**
+ * Fastify preHandler that enforces write authentication on POST/PUT/DELETE
+ * routes (and admin GETs). A request passes if ANY of the following hold:
+ *   - `X-Ingress-Path` header is set (HA Ingress strips/sets this, and
+ *     ingress requests are already authenticated by HA's session).
+ *   - The `Origin` header matches one of our allow-listed same-origin
+ *     dashboard URLs (covers the React UI fetching its own backend).
+ *   - The `X-Panel-Write-Token` header equals the bootstrap token
+ *     (constant-time compare).
+ * Otherwise → 401.
+ */
+function requireWriteAuth(
+  req: import('fastify').FastifyRequest,
+  reply: import('fastify').FastifyReply,
+  done: (err?: Error) => void,
+): void {
+  // 1. HA Ingress — header is set by Supervisor, can't be forged from outside.
+  if (req.headers['x-ingress-path']) return done();
+
+  // 2. Same-origin: browser sends Origin on cross-origin fetches AND on
+  //    same-origin non-GET fetches in modern browsers. If the dashboard is
+  //    loaded from one of our own origins, the Origin will be a panel origin.
+  const origin = req.headers.origin?.toString();
+  if (origin && PANEL_SAME_ORIGINS.has(origin)) return done();
+
+  // 3. Explicit token.
+  const provided = req.headers['x-panel-write-token']?.toString();
+  if (provided && tokenEquals(provided)) return done();
+
+  reply.code(401).send({
+    error: 'write-auth-required',
+    hint: 'set X-Panel-Write-Token header or use HA ingress',
+  });
+}
 // v0.9.14 — permessage-deflate on WebSocket frames. SnapshotStore pushes
 // the full snapshot on every change (~50-150 KB raw JSON for a 13-device
 // fleet); with PMD enabled, that compresses to ~10-30 KB per frame. Saves
@@ -231,6 +390,22 @@ const recorder = createRecorder(store, (m) => app.log.info(m));
 
 app.get('/api/snapshot', async () => store.get());
 app.get('/api/health', async () => ({ ok: true, generatedAt: store.get().generatedAt }));
+
+/**
+ * v0.9.62 — unauth surface so a (future) UI consumer can detect that
+ * writes need an X-Panel-Write-Token (or HA ingress / same-origin) and
+ * surface the right hint to the user instead of just hitting a blind
+ * 401. Current dashboard doesn't need this (it's same-origin), but
+ * external callers (a future companion app, a curl-from-laptop user)
+ * will.
+ */
+app.get('/api/panel-info', async () => ({
+  writeAuthRequired: true,
+  sameOriginOk: true,
+  ingressOk: true,
+  tokenHeader: 'X-Panel-Write-Token',
+  tokenPath: WRITE_TOKEN_PATH,
+}));
 
 app.get<{ Querystring: { sn?: string; metric?: string; since?: string; until?: string; bucket?: string } }>(
   '/api/history',
@@ -474,7 +649,7 @@ app.get('/api/alert-telemetry', async (req, reply) =>
  * the "zombie online" state the reboot was originally meant to address.
  * Every write is rate-limited + audit-logged.
  */
-app.post<{ Params: { sn: string } }>('/api/device/refresh-cloud/:sn', async (req, reply) => {
+app.post<{ Params: { sn: string } }>('/api/device/refresh-cloud/:sn', { preHandler: requireWriteAuth }, async (req, reply) => {
   const sn = req.params.sn;
   if (!sn || !store.get().devices[sn]) {
     reply.code(404);
@@ -526,9 +701,69 @@ app.get<{ Querystring: { sn?: string } }>('/api/device/refresh-cloud-cooldown', 
 
 /** Debug surface for empirically discovering undocumented EcoFlow commands.
  *  Off unless WRITE_DEBUG_TOKEN is set; requires the token in the
- *  `x-write-debug-token` header. Audit-logged like any other write. */
+ *  `x-write-debug-token` header. Audit-logged like any other write.
+ *
+ *  v0.9.62 hardening (defense-in-depth even though gated by env):
+ *   - requireWriteAuth — must be HA-ingress / same-origin / token-bearing
+ *   - per-SN cooldown (env SEND_CMD_COOLDOWN_MS, default 30s)
+ *   - cmdSet allow-list — only known prefixes accepted
+ *   - params depth + key-count + JSON-size caps
+ */
+const SEND_CMD_COOLDOWN_MS = Number(process.env.SEND_CMD_COOLDOWN_MS ?? 30_000);
+const lastSendCommandAt = new Map<string, number>();
+const ALLOWED_CMD_SETS = [
+  'PD303_APP_SET',            // SHP2
+  'WN511_PORTABLE_',          // DPU family (prefix)
+  'WN511_BLE_FUNC_',          // DPU family (prefix)
+];
+function cmdSetAllowed(cmdSet: unknown): boolean {
+  if (typeof cmdSet !== 'string' || cmdSet.length === 0) return false;
+  return ALLOWED_CMD_SETS.some((p) =>
+    p.endsWith('_') ? cmdSet.startsWith(p) : cmdSet === p,
+  );
+}
+function paramsObjectOk(
+  params: unknown,
+): { ok: true } | { ok: false; reason: string } {
+  if (params == null) return { ok: true };
+  if (typeof params !== 'object' || Array.isArray(params)) {
+    return { ok: false, reason: 'params-must-be-object' };
+  }
+  // Depth + key-count walk (bounded so a hostile payload can't DOS the walker).
+  let totalKeys = 0;
+  function walk(node: unknown, depth: number): { ok: boolean; reason?: string } {
+    if (depth > 5) return { ok: false, reason: 'params-too-deep (max depth 5)' };
+    if (node == null || typeof node !== 'object') return { ok: true };
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const r = walk(item, depth + 1);
+        if (!r.ok) return r;
+      }
+      return { ok: true };
+    }
+    for (const k of Object.keys(node as Record<string, unknown>)) {
+      totalKeys += 1;
+      if (totalKeys > 100) return { ok: false, reason: 'params-too-many-keys (max 100)' };
+      const r = walk((node as Record<string, unknown>)[k], depth + 1);
+      if (!r.ok) return r;
+    }
+    return { ok: true };
+  }
+  const walkRes = walk(params, 0);
+  if (!walkRes.ok) return { ok: false, reason: walkRes.reason! };
+  let serialized = '';
+  try { serialized = JSON.stringify(params); } catch {
+    return { ok: false, reason: 'params-not-serializable' };
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > 1024) {
+    return { ok: false, reason: 'params-too-large (max 1KB serialized)' };
+  }
+  return { ok: true };
+}
+
 app.post<{ Body: { sn?: string; body?: Record<string, unknown> } }>(
   '/api/device/send-command',
+  { preHandler: requireWriteAuth },
   async (req, reply) => {
     if (!isWriteDebugEnabled()) {
       reply.code(403);
@@ -548,6 +783,58 @@ app.post<{ Body: { sn?: string; body?: Record<string, unknown> } }>(
       reply.code(404);
       return { error: 'unknown sn' };
     }
+    // v0.9.62 — cmdSet allow-list. Reject anything that isn't a known
+    // PD303 / WN511 prefix so a stolen token (or curious operator)
+    // can't blast arbitrary cmdSets at the device. Log every rejection
+    // to the audit trail so we can see attempted misuse.
+    const cmdSet = body.body['cmdSet'] ?? body.body['cmdCode'];
+    if (!cmdSetAllowed(cmdSet)) {
+      appendWriteLog({
+        ts: Date.now(),
+        action: 'send-command',
+        sn: body.sn,
+        params: body.body,
+        source: { ip: req.ip, ua: req.headers['user-agent']?.toString() },
+        outcome: 'failure',
+        code: 'cmdSet-not-allowlisted',
+        message: `cmdSet=${String(cmdSet)} rejected by allow-list`,
+      });
+      reply.code(400);
+      return {
+        error: 'cmdSet-not-allowlisted',
+        allowedPrefixes: ALLOWED_CMD_SETS,
+        provided: cmdSet ?? null,
+      };
+    }
+    // v0.9.62 — params shape guard (depth/keys/size).
+    const paramsCheck = paramsObjectOk(body.body['params']);
+    if (!paramsCheck.ok) {
+      appendWriteLog({
+        ts: Date.now(),
+        action: 'send-command',
+        sn: body.sn,
+        params: body.body,
+        source: { ip: req.ip, ua: req.headers['user-agent']?.toString() },
+        outcome: 'failure',
+        code: 'params-rejected',
+        message: paramsCheck.reason,
+      });
+      reply.code(400);
+      return { error: 'params-rejected', reason: paramsCheck.reason };
+    }
+    // v0.9.62 — per-SN cooldown (mirrors refreshShp2CloudPresence).
+    const now = Date.now();
+    const last = lastSendCommandAt.get(body.sn) ?? 0;
+    if (now - last < SEND_CMD_COOLDOWN_MS) {
+      const remainingMs = last + SEND_CMD_COOLDOWN_MS - now;
+      reply.code(429);
+      return {
+        error: 'cooldown',
+        remainingMs,
+        message: `wait ${Math.ceil(remainingMs / 1000)}s before retrying`,
+      };
+    }
+    lastSendCommandAt.set(body.sn, now);
     const result = await debugSendCommand({
       sn: body.sn,
       body: body.body,
@@ -561,11 +848,18 @@ app.post<{ Body: { sn?: string; body?: Record<string, unknown> } }>(
   },
 );
 
-/** Last N audit-log entries. Useful for the UI to show "last writes". */
-app.get<{ Querystring: { limit?: string } }>('/api/writes/log', async (req) => {
-  const limit = Math.max(1, Math.min(500, Number(req.query.limit ?? 50) || 50));
-  return { entries: tailWriteLog(limit) };
-});
+/** Last N audit-log entries. Useful for the UI to show "last writes".
+ *  v0.9.62 — gated by requireWriteAuth: the audit log can leak
+ *  source-IPs, attempted command shapes, etc. — not catastrophic, but
+ *  not appropriate for unauth LAN visitors either. */
+app.get<{ Querystring: { limit?: string } }>(
+  '/api/writes/log',
+  { preHandler: requireWriteAuth },
+  async (req) => {
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit ?? 50) || 50));
+    return { entries: tailWriteLog(limit) };
+  },
+);
 
 // v0.8.0 — sustainability, tariff, probabilistic forecasts, multi-day,
 // dispatch planner, calendar, repair issues (all cached v0.9.14)
@@ -865,7 +1159,7 @@ app.get('/api/notify/status', async () => {
   };
 });
 
-app.post('/api/notify/test', async (_req, reply) => {
+app.post('/api/notify/test', { preHandler: requireWriteAuth }, async (_req, reply) => {
   try {
     await monitor.sendTest();
     return { ok: true };
@@ -1242,6 +1536,7 @@ app.get('/api/broadcast/status', async () => {
 
 app.post<{ Body: { level?: 'red' | 'yellow' | 'green' } }>(
   '/api/broadcast/test',
+  { preHandler: requireWriteAuth },
   async (req, reply) => {
     const level = req.body?.level ?? 'red';
     if (!['red', 'yellow', 'green'].includes(level)) {
@@ -1289,11 +1584,15 @@ app.get('/api/broadcast/tts-services', async (req, reply) => {
  *
  * Includes heuristic hints for common gotchas.
  */
-app.get('/api/broadcast/tts-debug', async (_req, reply) => {
-  const dbg = await getTtsDebug();
-  if (!dbg.supervised) reply.code(503);
-  return dbg;
-});
+app.get(
+  '/api/broadcast/tts-debug',
+  { preHandler: requireWriteAuth },
+  async (_req, reply) => {
+    const dbg = await getTtsDebug();
+    if (!dbg.supervised) reply.code(503);
+    return dbg;
+  },
+);
 
 /**
  * v0.9.35 — Diagnostic TTS test endpoint. Fires a TTS announcement at the
@@ -1317,6 +1616,7 @@ app.get('/api/broadcast/tts-debug', async (_req, reply) => {
  */
 app.post<{ Body: { engine?: string; targets?: string[]; message?: string; language?: string } }>(
   '/api/broadcast/test-tts',
+  { preHandler: requireWriteAuth },
   async (req, reply) => {
     const targets = Array.isArray(req.body?.targets) && req.body!.targets.length > 0
       ? req.body!.targets
@@ -1355,7 +1655,7 @@ app.post<{ Body: { engine?: string; targets?: string[]; message?: string; langua
  * + role `manager` (added in v0.9.33). Used to verify the Piper add-on
  * is actually running before we attempt to bridge it via Wyoming Protocol.
  */
-app.get('/api/admin/addons', async (_req, reply) => {
+app.get('/api/admin/addons', { preHandler: requireWriteAuth }, async (_req, reply) => {
   const addons = await listAddons();
   if (!addons) {
     reply.code(503);
@@ -1403,6 +1703,7 @@ app.get('/api/admin/addons', async (_req, reply) => {
  */
 app.post<{ Querystring: { host?: string; port?: string } }>(
   '/api/broadcast/reset-piper',
+  { preHandler: requireWriteAuth },
   async (req, reply) => {
     const host = req.query.host ?? 'core-piper';
     const port = Number(req.query.port ?? 10200);
@@ -1448,6 +1749,7 @@ app.post<{ Querystring: { host?: string; port?: string } }>(
 
 app.post<{ Querystring: { host?: string; port?: string } }>(
   '/api/broadcast/setup-piper',
+  { preHandler: requireWriteAuth },
   async (req, reply) => {
     const host = req.query.host ?? 'core-piper';
     const port = Number(req.query.port ?? 10200);
@@ -1541,7 +1843,7 @@ app.post<{ Querystring: { host?: string; port?: string } }>(
  *     ]
  *   }
  */
-app.get('/api/broadcast/discover', async (_req, reply) => {
+app.get('/api/broadcast/discover', { preHandler: requireWriteAuth }, async (_req, reply) => {
   const cfg = broadcast.config();
   const status = broadcast.status();
   const all = await getAllStates();

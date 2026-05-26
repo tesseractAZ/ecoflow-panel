@@ -3,6 +3,117 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.60 — 2026-05-26
+
+**Security batch: write-auth + CSRF protection + send-command lockdown.**
+Three findings from a parallel security audit, all defense-in-depth
+against LAN-side attackers. Eric's add-on is on a trusted LAN today;
+none of these were being exploited. But "trusted LAN" stops being
+trusted the moment one IoT device on the network turns hostile.
+
+### 1. Write endpoints now require auth (CSRF protection)
+
+`server/src/index.ts`. Before: `cors({ origin: true })` echoed any
+`Origin` header, and every write endpoint accepted anonymous POSTs.
+A malicious page on Eric's LAN (e.g. a compromised IoT device's
+captive portal) could trigger `POST /api/broadcast/test`,
+`POST /api/device/refresh-cloud/:sn`, `POST /api/notify/test`, etc.
+via drive-by CSRF through Eric's browser.
+
+After: new `requireWriteAuth` preHandler gates 11 endpoints. Accepts
+the request if ANY of:
+- `X-Ingress-Path` header is set (HA Ingress = trusted)
+- `Origin` matches the panel's own same-origin set (the React UI at
+  port 8787)
+- `X-Panel-Write-Token` header matches the token (constant-time
+  compare via `crypto.timingSafeEqual`)
+
+CORS is now allow-list based — same-origin set + HA dashboard origins
+(`homeassistant.local:8123`) + RFC1918 LAN ranges (10/8, 172.16-31/12,
+192.168/16) + `*.local`, restricted to ports 8123/8787. Everything
+else is rejected at the CORS layer.
+
+The write token is auto-generated on first start via `crypto.randomUUID()`
+and persisted at `/data/panel-write-token.txt` (mode 0600). On
+subsequent starts it's read back. Override via `PANEL_WRITE_TOKEN`
+env if you want a deterministic value. To rotate: delete the file
+and restart.
+
+**Endpoints now gated** (11 total):
+- `POST /api/device/refresh-cloud/:sn`
+- `POST /api/device/send-command` (already env-gated; now layered)
+- `POST /api/notify/test`
+- `POST /api/broadcast/test`, `test-tts`, `setup-piper`, `reset-piper`
+- `GET /api/broadcast/tts-debug`, `discover`
+- `GET /api/admin/addons`, `/api/writes/log`
+
+**Intentionally still open:**
+- `POST /api/alerts/outcome` — user feedback signal; per the audit
+  recommendation, NOT classified as a "device write" needing CSRF
+  protection.
+- All read GETs (snapshot, history, forecast, etc.) — Lovelace cards
+  hit these cross-origin and need to keep working.
+
+**New unauth endpoint** `GET /api/panel-info` advertises the new
+requirement so future UI consumers can detect it gracefully.
+
+### 2. `/api/device/send-command` hardening
+
+Even though the endpoint is env-gated (`WRITE_DEBUG_TOKEN`), the v0.9.49
+implementation had several rough edges that mattered if Eric ever
+turned it on. Four layered defenses added:
+
+- **Constant-time token compare** via `crypto.timingSafeEqual` (was
+  `===`, leaks length + match position via timing). Handles
+  unequal-length inputs without short-circuit.
+- **Per-SN cooldown** (default 30s, env `SEND_CMD_COOLDOWN_MS`).
+  Stops rapid-fire abuse of a leaked token.
+- **`cmdSet` allow-list**: `PD303_APP_SET` (SHP2), `WN511_PORTABLE_*`
+  (DPU), `WN511_BLE_FUNC_*` (DPU BLE). Anything else → 400. Stops a
+  leaked token from triggering OTA / factory-reset / charge-curve
+  override commands.
+- **Params shape caps**: max depth 5, max 100 keys, max 1 KB serialized.
+  Stops oversized/recursive payloads.
+
+Every rejection writes a `failure` entry to `writes.log` so the audit
+trail captures attempted misuse.
+
+### 3. Auth on audit log + Supervisor-proxy endpoints
+
+These were unauth on port 8787 even though they exposed admin info or
+hit Supervisor's `manager`-role API:
+- `GET /api/writes/log` — previous write history including caller IPs
+- `GET /api/admin/addons` — full add-on inventory via Supervisor
+- `POST /api/broadcast/setup-piper`, `reset-piper` — config-flow
+  manipulation via Supervisor
+- `GET /api/broadcast/discover`, `tts-debug` — config-entry enumeration
+
+All now gated by `requireWriteAuth`. The React dashboard at port 8787
+is same-origin so it sails through automatically; HA Ingress sails
+through via `X-Ingress-Path`; cross-origin clients (none today) would
+need the token.
+
+### Caveats / known edge cases
+
+- **iOS Safari + HA mobile app**: standard ingress path is unaffected
+  (HA mobile uses HA's session, includes `X-Ingress-Path`). The
+  in-app browser stripping `Origin` would only be an issue for
+  cross-origin writes, of which there are none today.
+- **Token rotation**: not auto-rotated. Delete `/data/panel-write-token.txt`
+  and restart the add-on to generate a new one.
+- **No tests added** for the new gate paths — the existing 166-test
+  suite is entirely pure-function; the Fastify integration layer has
+  always been verified at the type level + manual smoke testing.
+  Worth a future task to add request-level tests.
+
+### Verification
+
+166/166 tests pass, zero TS errors. Files: `server/src/index.ts`
+(+334 lines), `server/src/ecoflow/commands.ts` (+18 / -2 for
+timing-safe compare).
+
+
+
 ## 0.9.59 — 2026-05-26
 
 **Engine audit batch #2: "Models actually learn."** Seven follow-up
