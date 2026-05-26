@@ -71,8 +71,11 @@ test('inferProtocol — Echo by entity name or platform', () => {
   assert.equal(inferProtocol('media_player.foo', { platform: 'alexa_media' }), 'echo');
 });
 
-test('inferProtocol — unknown is unknown (treated as cast at fire-time)', () => {
-  assert.equal(inferProtocol('media_player.mystery_box', {}), 'unknown');
+// v0.9.57 — un-inferable entities now default to 'cast' instead of 'unknown'.
+// defaultBufferMs already treated unknown as cast (both 1000 ms) — the rename
+// just stops the noisy `unknown×N` groups in broadcast logs.
+test('inferProtocol — un-inferable entity defaults to cast', () => {
+  assert.equal(inferProtocol('media_player.mystery_box', {}), 'cast');
 });
 
 test('defaultBufferMs — airplay > cast > sonos', () => {
