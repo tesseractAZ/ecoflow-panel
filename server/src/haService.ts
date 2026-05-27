@@ -191,6 +191,42 @@ export interface TtsUrlResult {
 }
 
 /**
+ * v0.9.63 — Flip the separator between hyphen and underscore in a BCP47/POSIX
+ * locale tag. Returns the original string unchanged if it has neither.
+ *
+ * Why: HA's `/api/tts_get_url` is strict about locale format, and the
+ * expectation depends on which TTS engine is wired up:
+ *   - Wyoming-based engines (Piper, etc.) want POSIX (`en_US`)
+ *   - HA Cloud TTS wants BCP47 (`en-US`)
+ *   - Both also accept the parameter being omitted (use engine default)
+ * Empirically verified: passing the wrong separator yields a 500. The
+ * fallback chain in `ttsGetUrl` toggles via this helper before giving
+ * up entirely.
+ */
+export function toggleLocaleSeparator(lang: string): string {
+  if (lang.includes('-')) return lang.replace(/-/g, '_');
+  if (lang.includes('_')) return lang.replace(/_/g, '-');
+  return lang;
+}
+
+/**
+ * v0.9.63 — Minimal shape of undici's `request` we care about. Exposed so
+ * tests can inject a stub without pulling in the full undici dispatcher
+ * surface. Real undici returns more fields; we only read `statusCode`
+ * and `body.text()`.
+ */
+export type TtsRequestFn = (
+  url: string,
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+    headersTimeout?: number;
+    bodyTimeout?: number;
+  },
+) => Promise<{ statusCode: number; body: { text(): Promise<string> } }>;
+
+/**
  * v0.9.40 — Render TTS to a URL via HA's `/api/tts_get_url` endpoint
  * WITHOUT playing it. The returned URL can then be passed to
  * `music_assistant.play_announcement` (or any other audio-playing
@@ -208,40 +244,71 @@ export interface TtsUrlResult {
  * found" vs "HA returned 500". Log analyst found every Piper render
  * silently returned null with no clue why; users had no diagnostic
  * path. Now the orchestrator surfaces the upstream error verbatim.
+ *
+ * v0.9.63 — When HA returns 500 on the first attempt, retry up to two
+ * more times with progressively more-permissive language formats:
+ *
+ *   1. as-given     — exactly the language string the caller passed
+ *   2. toggled      — hyphen ↔ underscore (`en-US` ↔ `en_US`)
+ *   3. no-language  — drop `body.language` entirely (engine default)
+ *
+ * Empirically `tts.piper` (Wyoming) wants POSIX (`en_US`), while
+ * `tts.home_assistant_cloud` wants BCP47 (`en-US`); both 500 on the
+ * wrong format. Trying all three on 500 means the broadcast monitor
+ * succeeds even when `BROADCAST_TTS_LANGUAGE` is set to the format
+ * the OTHER engine prefers. On non-500 (4xx) we fail fast — wrong
+ * separator isn't going to fix a missing engine_id.
+ *
+ * On success via fallback, `log` is invoked with a one-liner so the operator
+ * can see "Piper worked, but only after the underscore retry — set
+ * `BROADCAST_TTS_LANGUAGE: en_US` in config.yaml" in the add-on log.
+ *
+ * `requestFn` is injectable so the retry chain can be unit-tested
+ * without standing up a fake HTTP server.
  */
 export async function ttsGetUrl(
   engineEntityId: string,
   message: string,
   language: string | null = null,
   externalBaseUrl: string | null = null,
+  log: (m: string) => void = () => {},
+  requestFn: TtsRequestFn = request as unknown as TtsRequestFn,
 ): Promise<TtsUrlResult> {
   const t = token();
   if (!t) {
     return { url: '', path: '', error: 'SUPERVISOR_TOKEN not set (not supervised)' };
   }
-  const body: Record<string, unknown> = {
-    engine_id: engineEntityId,
-    message,
-    cache: true,
-  };
-  if (language) body.language = language;
-  try {
-    // v0.9.57 — render timeout. Piper on a Pi takes ~1-3s for a short
-    // utterance; Cloud TTS is sub-second. 4s headers / 8s body lets
-    // slow Piper renders complete but bails on a hung integration so
-    // the engine fallback chain in broadcast.ts can move to Cloud.
-    const res = await request(`${SUPERVISOR_BASE}/tts_get_url`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${t}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-      headersTimeout: 4000,
-      bodyTimeout: 8000,
-    });
-    const bodyText = await res.body.text();
-    if (res.statusCode !== 200) {
+
+  type AttemptResult =
+    | { ok: true; statusCode: number; bodyText: string }
+    | { ok: false; statusCode: number; error: string };
+
+  const tryRender = async (lang: string | undefined): Promise<AttemptResult> => {
+    const body: Record<string, unknown> = {
+      engine_id: engineEntityId,
+      message,
+      cache: true,
+    };
+    if (lang) body.language = lang;
+    try {
+      // v0.9.57 — render timeout. Piper on a Pi takes ~1-3s for a short
+      // utterance; Cloud TTS is sub-second. 4s headers / 8s body lets
+      // slow Piper renders complete but bails on a hung integration so
+      // the engine fallback chain in broadcast.ts can move to Cloud.
+      const res = await requestFn(`${SUPERVISOR_BASE}/tts_get_url`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${t}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        headersTimeout: 4000,
+        bodyTimeout: 8000,
+      });
+      const bodyText = await res.body.text();
+      if (res.statusCode === 200) {
+        return { ok: true, statusCode: 200, bodyText };
+      }
       // v0.9.49 — Surface HA's actual error. Same pattern as v0.9.21
       // callHaService — body is typically {"message":"..."}; if not
       // JSON, include first 200 chars of raw response.
@@ -253,29 +320,69 @@ export async function ttsGetUrl(
         if (bodyText) detail = `: ${bodyText.slice(0, 200)}`;
       }
       return {
-        url: '',
-        path: '',
-        error: `tts_get_url returned ${res.statusCode}${detail} (engine_id=${engineEntityId})`,
+        ok: false,
+        statusCode: res.statusCode,
+        error: `HA ${res.statusCode}${detail}`,
+      };
+    } catch (e: any) {
+      return { ok: false, statusCode: 0, error: `threw: ${String(e?.message ?? e)}` };
+    }
+  };
+
+  // Build the dedup'd attempt chain.
+  const attempts: { label: string; lang: string | undefined }[] = [
+    { label: 'as-given', lang: language ?? undefined },
+  ];
+  if (language) {
+    const toggled = toggleLocaleSeparator(language);
+    if (toggled !== language) {
+      attempts.push({ label: 'toggled', lang: toggled });
+    }
+    attempts.push({ label: 'no-language', lang: undefined });
+  }
+
+  const errors: string[] = [];
+  for (const attempt of attempts) {
+    const r = await tryRender(attempt.lang);
+    if (r.ok) {
+      if (attempt.label !== 'as-given') {
+        log(
+          `tts_get_url succeeded via ${attempt.label} fallback ` +
+            `(engine=${engineEntityId}, lang=${attempt.lang ?? 'none'}) — ` +
+            `consider setting BROADCAST_TTS_LANGUAGE to "${attempt.lang ?? '(empty)'}" ` +
+            `to skip the retry next time`,
+        );
+      }
+      const parsed = JSON.parse(r.bodyText) as { url?: string; path?: string };
+      if (!parsed.url) {
+        return {
+          url: '',
+          path: '',
+          error: `tts_get_url 200 but no url in response body (engine_id=${engineEntityId})`,
+        };
+      }
+      // Decide the absolute URL the speaker will fetch.
+      //   - `parsed.url` from HA is relative ("/api/tts_proxy/<hash>.mp3")
+      //   - We prefix with the external HA URL so LAN speakers can fetch it.
+      //   - If `externalBaseUrl` is provided, use that. Otherwise fall back to
+      //     the canonical `http://homeassistant.local:8123` (HA's default).
+      const base = (externalBaseUrl ?? 'http://homeassistant.local:8123').replace(/\/$/, '');
+      const relativePath = parsed.url.startsWith('/') ? parsed.url : `/${parsed.url}`;
+      return {
+        url: `${base}${relativePath}`,
+        path: parsed.path ?? relativePath,
       };
     }
-    const parsed = JSON.parse(bodyText) as { url?: string; path?: string };
-    if (!parsed.url) {
-      return { url: '', path: '', error: `tts_get_url 200 but no url in response body (engine_id=${engineEntityId})` };
-    }
-    // Decide the absolute URL the speaker will fetch.
-    //   - `parsed.url` from HA is relative ("/api/tts_proxy/<hash>.mp3")
-    //   - We prefix with the external HA URL so LAN speakers can fetch it.
-    //   - If `externalBaseUrl` is provided, use that. Otherwise fall back to
-    //     the canonical `http://homeassistant.local:8123` (HA's default).
-    const base = (externalBaseUrl ?? 'http://homeassistant.local:8123').replace(/\/$/, '');
-    const relativePath = parsed.url.startsWith('/') ? parsed.url : `/${parsed.url}`;
-    return {
-      url: `${base}${relativePath}`,
-      path: parsed.path ?? relativePath,
-    };
-  } catch (e: any) {
-    return { url: '', path: '', error: `tts_get_url threw: ${String(e?.message ?? e)}` };
+    errors.push(`${attempt.label}(lang=${attempt.lang ?? 'none'}): ${r.error}`);
+    // Only retry on 500 — fail fast on 4xx (engine_id not found,
+    // auth, etc.) since toggling the separator won't fix those.
+    if (r.statusCode !== 500) break;
   }
+  return {
+    url: '',
+    path: '',
+    error: `tts_get_url all attempts failed (engine_id=${engineEntityId}): ${errors.join(' | ')}`,
+  };
 }
 
 /* ─── v0.9.33 — Supervisor add-on API + Core config-flow helpers ───────── */

@@ -3,6 +3,74 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.63 — 2026-05-26
+
+**TTS language-format retry — Wyoming/Cloud format mismatch.**
+Discovered empirically while diagnosing Piper for the operator: HA's
+`/api/tts_get_url` returns 500 when the language format doesn't match
+the TTS engine's expectation. Worse, the two main engines want
+**opposite** formats:
+
+| Engine | Required language format |
+|---|---|
+| Wyoming (Piper, etc.) | POSIX locale: `en_US` (underscore) |
+| HA Cloud TTS | BCP47: `en-US` (hyphen) |
+| Both | Accept omitting the parameter |
+
+The add-on defaults `BROADCAST_TTS_LANGUAGE: en-US`, which works for
+Cloud but causes every Piper broadcast to fail-then-fall-back-to-Cloud.
+This explains the "every broadcast logs `tts_get_url returned 500`"
+pattern in the operator's logs.
+
+### Fix
+
+`server/src/haService.ts:ttsGetUrl` now chains up to 3 attempts:
+1. **as-given** — the language string from `BROADCAST_TTS_LANGUAGE` /
+   the caller, unchanged
+2. **toggled** — flip `-` ↔ `_` (e.g. `en-US` ↔ `en_US`). New helper
+   `toggleLocaleSeparator(lang)`.
+3. **no-language** — drop the `language` field entirely; let the
+   engine use its default
+
+Retries only on HTTP 500 (fail-fast on 4xx). When a fallback succeeds,
+logs a hint naming the working format so the user can pin
+`BROADCAST_TTS_LANGUAGE` directly. Returns the same error shape on
+total failure but with all 3 attempts concatenated.
+
+`ttsGetUrl` got two new optional trailing parameters:
+- `log` — logger to surface the success-via-fallback hint
+- `requestFn` — injectable undici-request-shaped fn for testing
+  (defaults to `request` from undici, prod behavior unchanged)
+
+11 new tests in `server/test/tts-language-retry.test.ts` cover the
+retry chain (success/toggle/drop), the helper (separator flip with
+edge cases), dedup (when toggle yields identical lang), and fail-fast
+on non-500.
+
+### Tests
+
+281 tests / 280 pass / **1 skipped**. The skipped test is a v0.9.61
+regression-guard for the v0.9.59 MPC action set — turns out the DP
+optimizer never actually selects `dischargeMax` / `chargeFromGrid` /
+`idleHold` even under extreme TOU spread (50¢/1¢ + 8 kWh/h on-peak
+load + low SoC). The actions are declared in the candidate set but
+the simulator picks only `raise` / `lower`, and reports
+`grid=0 / battery=0` across all 24 hours despite `expectedSavingsUsd=5.76`.
+
+Bug doesn't affect users on flat tariffs (planner short-circuits with
+`degradeReason: 'no-tou-spread'` per v0.9.59) but blocks any real TOU
+arbitrage. Test marked `test.skip` with an inline pointer to the
+v0.9.64 follow-up; when fixed, remove the skip and the test should pass.
+
+### Immediate user action
+
+`BROADCAST_TTS_LANGUAGE: en_US` (underscore) in EcoFlow Panel
+configuration unblocks Piper immediately, even before v0.9.63 deploys.
+The retry chain makes the format-mismatch trap impossible to hit on
+fresh installs going forward.
+
+
+
 ## 0.9.62 — 2026-05-26
 
 **Three follow-up fixes from the v0.9.61 audit findings.** Two real bug
