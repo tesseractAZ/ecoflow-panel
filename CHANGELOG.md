@@ -3,6 +3,80 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.74 — 2026-05-28
+
+**SHP2 membership filter for fleet aggregations + log review fixes.**
+
+Detailed review of the 04:58 UTC log surfaced one core architecture
+issue plus three smaller cleanups. The architecture issue: every
+"fleet" aggregation in the codebase summed across all DPUs on the
+EcoFlow Cloud account, including SPARE cores that aren't physically
+connected to any SHP2. For Eric's setup (3 of 5 cores connected),
+this overstated HA Energy Dashboard lifetime totals and live tile
+values by ~40–67%.
+
+### The fix — SHP2 membership filter
+
+New `server/src/shp2Membership.ts` exposes `shp2ConnectedDpuSns()` +
+`isShp2Connected()`. A DPU contributes to fleet totals only if its
+SN appears in `shp2.projection.sources[].sn` with `isConnected: true`.
+DPU-only setups (no SHP2 at all) fall through to the previous
+unfiltered behavior — empty connected-set → `isShp2Connected` returns
+true for every SN.
+
+### Threaded through (4 critical call sites)
+
+- `index.ts:893` — `/api/ha-state` `fleet_pv_watts` / `fleet_total_in/out_watts` /
+  `fleet_battery_net_watts` / `ac_import_watts` now filter to connected.
+- `mqttDiscovery.ts:303` — same payload, same filter, so HA's MQTT
+  Discovery entities match the REST endpoint.
+- `recorder.ts:368` — `fleet_pv_wh` lifetime contributor list excludes
+  spare cores (was already correct for `fleet_grid_import_wh`).
+- `recorder.ts:425` — `computeBmsBatteryTotals` filters BMS sum to
+  SHP2-connected cores (this was the worst offender — spare cores'
+  bench-charge cycles were inflating "lifetime battery in/out").
+
+### One-time rollover
+
+The pre-v0.9.74 persisted lifetime counters have spare-core history
+baked in. A simple "filter going forward" leaves the BMS floor pinned
+at the old over-stated value — the counter would never advance again.
+Fix: on first v0.9.74 start, the recorder writes 0 to
+`fleet_battery_charge_wh`, `fleet_battery_discharge_wh`, `fleet_pv_wh`,
+and `fleet_grid_import_wh`, then drops a marker at
+`/data/.shp2-filter-v1.flag` so subsequent boots don't re-reset. HA
+Energy Dashboard sees this as a meter reset (handled by
+`state_class: total_increasing`); the next day's delta + every day
+thereafter will be accurate.
+
+### Smaller fixes from the log review
+
+- `index.ts:316` — new `GET /api/version` returns `{ version, builtAt,
+  ref }` from the build-time env vars. Quick debug surface; replaces
+  the 404 the log showed when Eric probed for it.
+- `recorder.ts:158` — "wrote N samples" per-tick chatter (~88% of log
+  volume per the audit) replaced with a once-per-minute aggregate
+  heartbeat. Surfaces total + peak burst when there's activity, silent
+  when there isn't.
+- `server/test/shp2Membership.test.ts` — 8 new tests pinning the
+  membership-filter contract (empty Set fallback, isConnected:false
+  exclusion, missing SN handling, Eric-scenario membership).
+
+### Not in v0.9.74 (deferred)
+
+- `analytics.ts:1446` `computeDegradation` peer-baseline filter (P1).
+  16 call sites in analytics.ts compute "all DPUs" aggregates; needs
+  case-by-case audit (per-DPU degradation is correct as-is, but the
+  peer-median baseline drags in spare-pack data). Worth a focused
+  follow-up release.
+- Web-side `SystemSummary.tsx` / `ThermalPanel.tsx` aggregates.
+  The Lit HACS cards + React UI both compute their own fleet sums.
+  Server-side is now correct; UI-side is next.
+
+### Test count
+
+308 (was 301 in v0.9.73; +8 new SHP2 membership tests, -1 obsolete).
+
 ## 0.9.73 — 2026-05-28
 
 **Fix: `/audio-render/` only served files that existed at addon startup;

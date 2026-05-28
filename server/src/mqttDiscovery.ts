@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import type { SnapshotStore, FleetSnapshot } from './snapshot.js';
 import type { Recorder } from './recorder.js';
 import type { DpuProjection, Shp2Projection } from './ecoflow/project.js';
+import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
 import {
   getDayForecast,
   computeDegradation,
@@ -303,16 +304,18 @@ export async function startMqttDiscovery(
     const dpus = (devices as DpuDev[]).filter((d) => d.online && d.projection?.kind === 'dpu');
     const shp2 = (devices as Shp2Dev[]).find((d) => d.projection?.kind === 'shp2');
 
+    // v0.9.74 — match /api/ha-state: spare cores (not in SHP2 sources)
+    // can't deliver energy to the home, so they don't count toward
+    // fleet PV / total-in / total-out / battery-net or grid-import.
+    const connected = shp2ConnectedDpuSns(snap.devices);
+    const gridDpus = dpus.filter((d) => isShp2Connected(d.sn, connected));
+
     let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0;
-    for (const d of dpus) {
+    for (const d of gridDpus) {
       fleetPv += d.projection.pvTotalWatts ?? 0;
       fleetIn += d.projection.totalInWatts ?? 0;
       fleetOut += d.projection.totalOutWatts ?? 0;
-    }
-    if (shp2) {
-      const sourceSns = new Set(shp2.projection.sources.map((s) => s.sn).filter((s): s is string => !!s));
-      const gridDpus = sourceSns.size > 0 ? dpus.filter((d) => sourceSns.has(d.sn)) : dpus;
-      for (const d of gridDpus) acIn += d.projection.acInWatts ?? 0;
+      acIn += d.projection.acInWatts ?? 0;
     }
     let panelLoad = 0;
     if (shp2) for (const c of shp2.projection.circuits) panelLoad += c.watts ?? 0;

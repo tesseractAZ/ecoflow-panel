@@ -11,6 +11,7 @@ import { config } from './config.js';
 import { createAuth } from './auth.js';
 import { SnapshotStore, startPollLoop } from './snapshot.js';
 import type { DeviceSnapshot } from './snapshot.js';
+import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
 import { startMqtt } from './ecoflow/mqtt.js';
 import { createRecorder } from './recorder.js';
 import { computeTotals, startOfLocalDayMs, circuitHistoryByDay } from './aggregator.js';
@@ -313,6 +314,19 @@ const recorder = createRecorder(store, (m) => app.log.info(m));
 
 app.get('/api/snapshot', async () => store.get());
 app.get('/api/health', async () => ({ ok: true, generatedAt: store.get().generatedAt }));
+
+/**
+ * v0.9.74 — unauth version stamp. Quick debug surface to confirm which
+ * release a panel is running without having to crack open `/api/snapshot`
+ * or read the addon log. Returns the `BUILD_VERSION` env var set by
+ * `images.yml` at build time (e.g. "0.9.74"), falling back to "dev" when
+ * running outside the Docker image.
+ */
+app.get('/api/version', async () => ({
+  version: process.env.BUILD_VERSION || 'dev',
+  builtAt: process.env.BUILD_DATE || null,
+  ref: process.env.BUILD_REF || null,
+}));
 
 /**
  * v0.9.62 — unauth surface so a (future) UI consumer can detect that
@@ -889,23 +903,20 @@ app.get('/api/ha-state', async (req, reply) => {
   const dpus = (devices as DpuDev[]).filter((d) => d.online && d.projection?.kind === 'dpu');
   const shp2 = (devices as Shp2Dev[]).find((d) => d.projection?.kind === 'shp2');
 
-  // Power flow — sum across the online DPUs.
-  let fleetPv = 0, fleetIn = 0, fleetOut = 0;
-  for (const d of dpus) {
+  // v0.9.74 — only SHP2-bound DPUs count toward fleet totals. Spare cores
+  // (here, Eric's Cores 4 + 5) inflate every "fleet PV / battery net /
+  // total in / total out" reading because their energy can't actually
+  // reach the home power bus. The previous code summed all 5 cores and
+  // overstated the home's available capacity by ~40%.
+  const connected = shp2ConnectedDpuSns(snap.devices);
+  const gridDpus = dpus.filter((d) => isShp2Connected(d.sn, connected));
+
+  let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0;
+  for (const d of gridDpus) {
     fleetPv += d.projection.pvTotalWatts ?? 0;
     fleetIn += d.projection.totalInWatts ?? 0;
     fleetOut += d.projection.totalOutWatts ?? 0;
-  }
-
-  // Grid import — only count AC-in on SHP2-bound DPUs. A spare DPU plugged
-  // into a wall outlet for self-charging does NOT make the house grid-tied.
-  let acIn = 0;
-  if (shp2) {
-    const sourceSns = new Set(
-      shp2.projection.sources.map((s) => s.sn).filter((s): s is string => !!s),
-    );
-    const gridDpus = sourceSns.size > 0 ? dpus.filter((d) => sourceSns.has(d.sn)) : dpus;
-    for (const d of gridDpus) acIn += d.projection.acInWatts ?? 0;
+    acIn += d.projection.acInWatts ?? 0;
   }
 
   // Panel load = sum of SHP2 circuit watts.

@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { config } from './config.js';
 import { SnapshotStore, FleetSnapshot } from './snapshot.js';
@@ -155,8 +155,26 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       db.prepare('ROLLBACK').run();
       throw e;
     }
-    if (written > 0) log(`recorder: wrote ${written} samples`);
+    // v0.9.74 — silence per-tick chatter. The previous "wrote N samples"
+    // line fired every 10 s under normal load (~44 lines/min, ~88 % of
+    // log volume). Aggregate to a once-per-minute heartbeat that
+    // surfaces total + peak burst, and only when there's activity.
+    recordedSamplesSinceTick += written;
+    recordedSamplesPeak = Math.max(recordedSamplesPeak, written);
+    const tickNowMs = Date.now();
+    if (tickNowMs - lastSampleLogAt >= 60_000) {
+      if (recordedSamplesSinceTick > 0) {
+        log(`recorder: ${recordedSamplesSinceTick} samples in last ${Math.round((tickNowMs - lastSampleLogAt) / 1000)}s (peak burst ${recordedSamplesPeak})`);
+      }
+      recordedSamplesSinceTick = 0;
+      recordedSamplesPeak = 0;
+      lastSampleLogAt = tickNowMs;
+    }
   }
+  // v0.9.74 — sample-write log throttling state. See recordSamples() above.
+  let recordedSamplesSinceTick = 0;
+  let recordedSamplesPeak = 0;
+  let lastSampleLogAt = Date.now();
 
   function extract(snap: FleetSnapshot): MetricSample[] {
     const out: MetricSample[] = [];
@@ -370,11 +388,15 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       const p = d.projection;
       if (!p) continue;
       if (p.kind === 'dpu') {
-        out.fleet_pv_wh.push({ sn: d.sn, metric: 'pv_total' });
-        // AC-in only counts as "grid import" for DPUs that are wired into
-        // SHP2's grid path. A spare DPU charging from a wall outlet is the
-        // user's choice, not "grid pulled by the house".
+        // v0.9.74 — fleet_pv_wh is the HA Energy Dashboard "lifetime PV
+        // production" counter. Only SHP2-connected DPUs deliver power
+        // to the home, so only their PV contributes. A spare core
+        // charging from an outdoor solar string is still genuine PV
+        // production but it isn't "the home's PV" until it's wired in.
+        // (Same gating logic as fleet_grid_import_wh below — the
+        // sourceSns.size === 0 fallback keeps DPU-only setups working.)
         if (sourceSns.size === 0 || sourceSns.has(d.sn)) {
+          out.fleet_pv_wh.push({ sn: d.sn, metric: 'pv_total' });
           out.fleet_grid_import_wh.push({ sn: d.sn, metric: 'ac_in' });
         }
       } else if (p.kind === 'shp2') {
@@ -413,8 +435,20 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
   const computeBmsBatteryTotals = (snap: FleetSnapshot): { chargeWh: number; dischargeWh: number } => {
     let chargeWh = 0;
     let dischargeWh = 0;
-    for (const d of Object.values(snap.devices)) {
+    // v0.9.74 — only SHP2-connected packs count toward the home's
+    // lifetime battery in/out totals. A spare core's BMS counts up
+    // every time it's charged on the bench but that energy never
+    // reaches the home. Without this filter the HA Energy Dashboard
+    // "battery charged / discharged" tile was ~67% overstated for
+    // setups with spare cores.
+    const devices = Object.values(snap.devices);
+    const shp2 = devices.find((d) => d.projection?.kind === 'shp2');
+    const sourceSns = shp2
+      ? new Set(((shp2.projection as Shp2Projection).sources ?? []).map((s) => s.sn).filter((s): s is string => !!s))
+      : new Set<string>();
+    for (const d of devices) {
       if (d.projection?.kind !== 'dpu') continue;
+      if (sourceSns.size > 0 && !sourceSns.has(d.sn)) continue;
       for (const pk of (d.projection as DpuProjection).packs) {
         if (pk.accuChgMah != null) chargeWh += pk.accuChgMah * PACK_MAH_TO_WH;
         if (pk.accuDsgMah != null) dischargeWh += pk.accuDsgMah * PACK_MAH_TO_WH;
@@ -422,6 +456,37 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
     }
     return { chargeWh, dischargeWh };
   };
+
+  // v0.9.74 — one-time reset for the SHP2-membership filter rollover.
+  //
+  // The previous code summed BMS counters across every DPU on the
+  // EcoFlow account, including spare cores. Now we filter to SHP2-
+  // connected only, which means the live `bms.chargeWh` value drops
+  // ~67% (in Eric's 3-of-5-connected setup). Without a reset, the
+  // persisted floor (from the 5-DPU sum) stays pinned and the HA
+  // Energy Dashboard battery counters never advance again.
+  //
+  // We also reset the watt-integrated PV and grid-import counters for
+  // the same reason — their persisted base is overstated by the
+  // spare cores' historical contributions. The marker file at
+  // `${DATA_DIR}/.shp2-filter-v1.flag` ensures this resets exactly
+  // once per install. HA's state_class: total_increasing treats the
+  // resulting one-time drop as a meter reset; the next day's delta
+  // (and every day thereafter) is correct.
+  // dbPath = /data/ecoflow.db, dirname → /data (the persistent volume).
+  const SHP2_FILTER_FLAG = resolve(dirname(dbPath), '.shp2-filter-v1.flag');
+  if (!existsSync(SHP2_FILTER_FLAG)) {
+    log('recorder: v0.9.74 first run — resetting fleet lifetime counters for SHP2-membership filter');
+    for (const key of ['fleet_battery_charge_wh', 'fleet_battery_discharge_wh', 'fleet_pv_wh', 'fleet_grid_import_wh']) {
+      writeLifetime(key, 0, Date.now());
+    }
+    try {
+      mkdirSync(dirname(SHP2_FILTER_FLAG), { recursive: true });
+      writeFileSync(SHP2_FILTER_FLAG, `reset at ${new Date().toISOString()}\n`, { mode: 0o644 });
+    } catch (e: any) {
+      log(`recorder: could not write reset marker ${SHP2_FILTER_FLAG}: ${e?.message ?? e} (next boot will reset again — non-fatal but noisy)`);
+    }
+  }
 
   // Track the highest BMS lifetime ever observed across this process so a
   // momentary readback dropout (BMS returns 0 / null mid-poll) doesn't
