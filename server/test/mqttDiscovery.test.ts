@@ -1,11 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import {
   SENSORS,
   BINARY_SENSORS,
   legacyUniqueIdsFor,
   MQTT_DISCOVERY_DEDUP_VERSION,
 } from '../src/mqttDiscovery.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Regression tests for the MQTT-discovery unique_id catalog
@@ -123,3 +128,52 @@ test('mqtt-discovery: dedup version is exposed for the once-only gate', () => {
   assert.equal(typeof MQTT_DISCOVERY_DEDUP_VERSION, 'number');
   assert.ok(MQTT_DISCOVERY_DEDUP_VERSION >= 1);
 });
+
+/**
+ * v0.9.69 — Pin MQTT v5 on every mqtt.connect() call in the codebase.
+ *
+ * HA Core 2026.x deprecates v3.1.1 to its broker and will drop support
+ * in 2027.1.0. The npm `mqtt` library defaults to v3.1.1 when
+ * `protocolVersion` is unset, which means a silent regression to v3.1.1
+ * is a one-deletion-away failure mode. These tests source-grep every
+ * file that calls `mqtt.connect` and assert the explicit v5 opt-in is
+ * present.
+ *
+ * Source-grep style (not a runtime mock) is deliberate: it tests the
+ * one thing that matters (the wire-level protocol we send to the
+ * broker) without coupling to the connection-options shape or
+ * requiring an mqtt-mocking layer. If you add a new `mqtt.connect`
+ * call, add the file to MQTT_SOURCE_FILES below — the test will fail
+ * fast if you forget the protocolVersion.
+ */
+const MQTT_SOURCE_FILES = [
+  '../src/mqttDiscovery.ts',  // HA Discovery → core-mosquitto
+  '../src/ecoflow/mqtt.ts',   // EcoFlow Cloud → mqtt-e.ecoflow.com
+];
+
+for (const relPath of MQTT_SOURCE_FILES) {
+  test(`mqtt v5: ${relPath} sets protocolVersion: 5 on mqtt.connect`, () => {
+    const src = readFileSync(resolve(__dirname, relPath), 'utf8');
+    // Confirm there's actually an mqtt.connect call we'd care about.
+    assert.ok(
+      /mqtt\.connect\(/.test(src),
+      `${relPath} has no mqtt.connect() — remove it from MQTT_SOURCE_FILES or restore the call`,
+    );
+    // Confirm protocolVersion: 5 is present. Whitespace-tolerant regex
+    // so we don't break on Prettier reformat.
+    assert.ok(
+      /protocolVersion\s*:\s*5\b/.test(src),
+      `${relPath} calls mqtt.connect but does not set protocolVersion: 5 — npm 'mqtt' defaults to v3.1.1 which HA deprecates in 2027.1.0`,
+    );
+    // Belt-and-suspenders: explicitly reject any protocolVersion that
+    // isn't 5. Catches typos like `protocolVersion: 4`.
+    const allMatches = [...src.matchAll(/protocolVersion\s*:\s*(\d+)/g)];
+    for (const m of allMatches) {
+      assert.equal(
+        m[1],
+        '5',
+        `${relPath} sets protocolVersion: ${m[1]} — only v5 is allowed`,
+      );
+    }
+  });
+}

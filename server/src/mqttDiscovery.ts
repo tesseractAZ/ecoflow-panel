@@ -182,6 +182,14 @@ export async function startMqttDiscovery(
     password: pass,
     clientId: `ecoflow-panel-discovery-${Math.random().toString(36).slice(2, 8)}`,
     reconnectPeriod: 30_000,
+    // v0.9.69 — explicitly request MQTT v5 (the npm `mqtt` library defaults
+    // to v3.1.1 when this is unset). HA Core 2026.x deprecates v3.1.1 to
+    // the broker and will remove support in 2027.1.0. Setting v5 here aligns
+    // every MQTT client in this codebase on one protocol and removes the
+    // "broker happens to bridge both" backward-compat dependency. v5 is
+    // wire-compatible with all of our usage (basic auth, will, retained
+    // QoS 0 publishes) so this is a drop-in change.
+    protocolVersion: 5,
     will: { topic: AVAILABILITY_TOPIC, payload: 'offline', retain: true, qos: 0 },
   });
 
