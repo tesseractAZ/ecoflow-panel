@@ -3,6 +3,62 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.69 — 2026-05-27
+
+**MQTT v5 everywhere — no more reliance on broker backward-compat.**
+
+Home Assistant Core 2026.x flagged the HA-to-broker connection (HA's
+own MQTT integration → `core-mosquitto`) as still configured for
+MQTT v3.1.1, with a hard cutoff in HA 2027.1.0. The deprecation is
+HA-internal — Mosquitto remains permissive and accepts both protocols
+from any client — but relying on that bridge is exactly the kind of
+silent backward-compat dependency that bites you later. Audited every
+`mqtt.connect()` call in the codebase and pinned all of them to v5.
+
+### Code change
+
+`server/src/mqttDiscovery.ts` — the HA Discovery publisher (one of two
+MQTT clients in this add-on). Was relying on the npm `mqtt` library's
+default `protocolVersion` (v3.1.1). Now explicitly sets
+`protocolVersion: 5`. The EcoFlow Cloud MQTT client at
+`server/src/ecoflow/mqtt.ts:64` was already on v5 — no change there.
+
+v5 is wire-compatible with our entire usage (basic auth, will message,
+retained QoS 0 publishes on the discovery topic, no Properties, no
+shared subscriptions), so this is a true drop-in. No behavior change
+visible from HA's side.
+
+### Test
+
+New regression test in `server/test/mqttDiscovery.test.ts` — source-
+greps every file in a curated `MQTT_SOURCE_FILES` list and asserts
+`protocolVersion: 5` is present on every `mqtt.connect()` call.
+Rejects any other `protocolVersion: N`. The list itself is the
+extension point: if you add a third MQTT client, add the file or the
+test fails immediately.
+
+Source-grep style chosen deliberately over runtime mocking — the one
+thing that matters is the wire-level protocol we send, and an mqtt-
+mocking layer would couple the test to connection-option shape.
+
+### Docs / misc
+
+This release also lands the doc audit from earlier today (README +
+DOCS.md updated to make MQTT Discovery the canonical HA-entity path,
+add Lovelace cards / broadcast-TTS / security sections, refresh
+"Shipped" bullets through v0.9.68, fix the broken
+`#mqtt-discovery-recommended` anchor, document all `BROADCAST_*`
+options in the options table). The roadmap-Standing item for the
+broadcast/TTS subsystem refactor stays in place.
+
+### Why now
+
+You don't lose anything waiting until 2027.1.0 forces the issue, but
+this came up while migrating the docs to recommend MQTT Discovery as
+the canonical HA-integration path (v0.9.68), so the cost of doing it
+now is a few lines + one test. Future-proofing while the context is
+already open.
+
 ## 0.9.68 — 2026-05-27
 
 **Entity-duplication audit and dedup defenses.** the operator reported 61

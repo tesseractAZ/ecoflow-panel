@@ -62,6 +62,19 @@ A local "control-room" dashboard and telnet TUI for an EcoFlow off-grid home
 | `TARIFF_OFF_PEAK_CENTS` | `8` | Off-peak rate in ¢/kWh. (v0.8.0) |
 | `TARIFF_ON_PEAK_HOURS` | `15-20` | Local hour range that counts as on-peak, e.g. APS-Saver `15-20` (3 PM – 8 PM). Wraps past midnight if start > end. (v0.8.0) |
 | `TARIFF_ON_PEAK_DAYS` | `1-5` | Day-of-week range that counts as on-peak (1=Mon … 7=Sun). Most utilities exclude weekends. (v0.8.0) |
+| `BROADCAST_ENABLED` | `false` | Master switch for the ship-wide audible broadcast subsystem (klaxon + TTS over HomePod / Sonos / Cast via HA `media_player`). (v0.9.18) |
+| `BROADCAST_TARGETS` | _(empty)_ | Comma-separated `media_player.*` entity IDs to broadcast to, e.g. `media_player.living_room, media_player.kitchen`. |
+| `BROADCAST_MIN_SEVERITY` | `critical` | Minimum alert severity that triggers a broadcast (`critical` or `warning`). |
+| `BROADCAST_QUIET_HOURS` | `22-06` | Local-hour window that suppresses warning/info broadcasts. Critical always fires. |
+| `BROADCAST_VOLUME` | `0.5` | Speaker volume (0.0–1.0) during the broadcast. |
+| `BROADCAST_AUDIO_BASE` | `http://homeassistant.local:8787` | URL the speakers fetch the klaxon WAVs from. Override to your HA IP if mDNS is flaky. |
+| `BROADCAST_USE_MUSIC_ASSISTANT` | `auto` | `auto` / `music_assistant` / `media_player`. MA's `play_announcement` plays simultaneously across targets + handles volume restore atomically; `auto` uses it when installed. (v0.9.23) |
+| `BROADCAST_SONOS_RESTORE` | `true` | Snapshot Sonos state before broadcasting + restore after, so a music session resumes. |
+| `BROADCAST_TTS_SERVICE` | _(auto)_ | Pin a specific TTS engine, e.g. `tts.speak:tts.piper`. Explicit pin **disables** the fallback chain — failure → klaxon only, never silent fallback. (v0.9.65) |
+| `BROADCAST_TTS_LANGUAGE` | `en-US` | Locale string. The add-on auto-retries `en-US` ↔ `en_US` ↔ no-language on HTTP 500 to handle the Wyoming/Cloud format mismatch. (v0.9.63) |
+| `BROADCAST_TTS_REQUIRE_LOCAL` | `false` | Set `true` to restrict TTS to local engines (Piper). No local engine → klaxon only, never Cloud fallback. Recommended for off-grid setups where Cloud TTS would silently fail during the outage you're broadcasting about. (v0.9.65) |
+| `BROADCAST_HA_EXTERNAL_URL` | _(empty)_ | HA Core base URL used to build `tts_proxy` URLs for speakers. Leave empty for `http://homeassistant.local:8123`. (v0.9.40) |
+| `WRITE_DEBUG_TOKEN` | _(empty)_ | Set to a non-empty secret to unlock `POST /api/device/send-command` for probing undocumented EcoFlow commands. Requires `x-write-debug-token` header on every call. Leave empty in normal operation. (v0.9.9) |
 
 ## Persistence
 
@@ -85,19 +98,46 @@ EcoFlow MQTT  ──live telemetry────┘
 
 ## Home Assistant entities
 
-**Pick ONE path — REST sensors below OR MQTT Discovery (recommended,
-described in the [MQTT Discovery](#mqtt-discovery-recommended) section).
-Don't enable both.** If both are active you'll see every metric twice
-in HA: once as `sensor.ecoflow_*` (REST, no device association) and
-once as `sensor.ecoflow_panel_ecoflow_*` (MQTT, with device auto-prefix
-on the entity_id). They update from the same data — the duplication is
-purely a registry-level artifact of HA seeing two `unique_id`s for the
-same metric. To clean up after enabling MQTT Discovery, delete this
-`rest:` block from `configuration.yaml`, then restart HA.
+The add-on can publish ~22 sensors + 1 binary_sensor into Home Assistant.
+**As of v0.9.68 the recommended (and only supported going forward) path
+is MQTT Discovery.** The legacy `rest:`-integration path still works for
+existing installs but is deprecated; new users should skip it.
+
+> **Don't enable both.** They use different `unique_id` schemes, so HA
+> registers each metric twice — once as `sensor.ecoflow_*` (REST, no
+> device association) and once as `sensor.ecoflow_panel_ecoflow_*`
+> (MQTT, device-scoped). To migrate off REST: delete the `rest:` block
+> from `configuration.yaml`, restart HA, then purge the orphaned
+> `sensor.ecoflow_*` entities from Settings → Devices & Services →
+> Entities (filter "ecoflow", select all with "no device", delete).
+> v0.9.68 also auto-clears the historical-mistake double-prefixed
+> `unique_id`s via a one-shot retained-empty sweep — no manual MQTT
+> cleanup needed.
+
+### MQTT Discovery (recommended)
+
+1. Make sure a Mosquitto broker is running (HA's official **Mosquitto
+   broker** add-on works out of the box).
+2. In this add-on's **Configuration** tab, set:
+   ```yaml
+   MQTT_DISCOVERY_ENABLED: true
+   MQTT_DISCOVERY_HOST: core-mosquitto       # if using HA's add-on
+   MQTT_DISCOVERY_PORT: 1883
+   MQTT_DISCOVERY_USER: <broker user>
+   MQTT_DISCOVERY_PASS: <broker pass>
+   ```
+3. Save → Restart. Entities auto-appear under the "EcoFlow Panel"
+   device in Settings → Devices & Services → MQTT, with entity_ids
+   like `sensor.ecoflow_panel_ecoflow_backup_pool`. No YAML required.
+
+The five Energy-Dashboard counters (`pv_production`,
+`home_consumption`, `grid_import_lifetime`, `battery_energy_in`,
+`battery_energy_out`) auto-register with `state_class: total_increasing`.
+Per-circuit Individual-devices entries are also published automatically.
 
 ---
 
-### REST sensors (legacy path)
+### REST sensors (legacy / deprecated path)
 
 The add-on exposes a flat key-value endpoint at `/api/ha-state` that's
 designed for HA's [`rest:` integration](https://www.home-assistant.io/integrations/rest/).
@@ -394,9 +434,6 @@ How the counters survive add-on restarts and pruning:
   begins a new accumulator forward — your historical Energy Dashboard
   totals before the wipe are preserved.
 
-If you use MQTT Discovery (set `MQTT_DISCOVERY_ENABLED: true`), all five
-sensors auto-register and the YAML snippet isn't needed.
-
 ### v0.8.0 — More HA integration recipes
 
 **Per-circuit Individual devices (Energy Dashboard).** When MQTT Discovery
@@ -561,6 +598,99 @@ Every key returned by `/api/ha-state`:
 | `learned_info_count` | int | Learned-engine info notices |
 | `fleet_devices_total` | int | Total devices known on the account |
 | `fleet_devices_online` | int | Currently online |
+
+## Lovelace cards (v0.9.50–v0.9.55)
+
+The add-on ships **9 Lit-based Lovelace cards** that you can add directly
+to any HA dashboard. They read from the same `/api/snapshot` endpoint the
+React UI uses, so they update in real time and don't need YAML config
+beyond a one-line resource declaration.
+
+Two ways to install:
+
+**Without HACS (simplest).** The add-on serves the bundles at
+`/lovelace/<card>.js`. Add each one as a resource:
+
+1. Settings → Dashboards → ⋮ → Resources → **Add resource**
+2. URL: `http://homeassistant.local:8787/lovelace/ecoflow-fleet-card.js`
+3. Resource type: **JavaScript module**
+4. Repeat for the other 8 (`ecoflow-alerts-card.js`,
+   `ecoflow-battery-card.js`, `ecoflow-solar-card.js`,
+   `ecoflow-strategy-card.js`, `ecoflow-insights-card.js`,
+   `ecoflow-circuit-card.js`, `ecoflow-broadcast-card.js`,
+   `ecoflow-stats-card.js`)
+
+**Via HACS.** Add `https://github.com/tesseractAZ/ecoflow-panel` as a
+Lovelace repository under HACS → Frontend → ⋮ → Custom repositories.
+HACS serves the same bundles at `/hacsfiles/EcoFlow-Panel-Card/*.js`.
+
+Then add each card with:
+
+```yaml
+type: custom:ecoflow-fleet-card    # or alerts / battery / solar / etc.
+```
+
+The cards auto-discover the add-on's host via `/api/config-summary` —
+no per-card config needed unless you want to override.
+
+## Broadcast / TTS (v0.9.18–v0.9.65)
+
+The broadcast subsystem fires a klaxon WAV + optional TTS announcement
+to HomePod / Sonos / Cast speakers via HA's `media_player` services when
+an alert transitions to critical. Off by default; opt in with
+`BROADCAST_ENABLED: true` plus `BROADCAST_TARGETS`.
+
+**Recommended off-grid config** (no Cloud TTS, ever):
+
+```yaml
+BROADCAST_ENABLED: true
+BROADCAST_TARGETS: "media_player.living_room, media_player.kitchen"
+BROADCAST_USE_MUSIC_ASSISTANT: auto    # uses MA if installed
+BROADCAST_TTS_REQUIRE_LOCAL: true      # restrict to Piper
+BROADCAST_TTS_SERVICE: ""              # leave empty for auto-pick
+```
+
+This requires HA's **Piper** add-on (Wyoming Protocol). The panel
+auto-detects Piper in HA's service catalog at startup. If Piper isn't
+available the broadcast plays klaxon only — it never silently falls
+back to Cloud TTS, which would fail during the off-grid outage the
+broadcast is announcing.
+
+**Language-retry chain.** The Wyoming protocol (Piper) wants
+POSIX-style locales (`en_US`), HA Cloud wants BCP47 (`en-US`).
+Whichever you set, the add-on retries the call with the toggled
+separator on HTTP 500, then with no `language` argument at all.
+This is invisible — you don't need to know which engine wants which
+format.
+
+**Debug + test endpoints:**
+
+- `GET /api/broadcast/status` — current config + last broadcast outcome
+- `POST /api/broadcast/test` body `{"level":"yellow"}` — fire a test
+  (bypasses severity gating + cooldown)
+- `POST /api/broadcast/test-tts` — TTS-only test, skips the klaxon
+- `GET /api/broadcast/tts-services` — what HA's TTS catalog looks like
+  from the add-on's perspective
+
+## Security (v0.9.60)
+
+Write endpoints require auth. Accepted credentials, in order:
+
+1. **HA Ingress.** The `X-Ingress-Path` header is set automatically when
+   you open the add-on through HA's sidebar. No extra config needed.
+2. **Same-origin.** The React UI at port 8787 hitting its own backend.
+3. **Write token.** An `X-Panel-Write-Token` header carrying the value
+   from `/data/panel-write-token.txt` (mode `0600`, auto-generated on
+   first start). Rotate by deleting the file and restarting the add-on.
+
+The `POST /api/device/send-command` debug path also requires
+`WRITE_DEBUG_TOKEN` set in the add-on config + the matching
+`x-write-debug-token` header on every call.
+
+Read endpoints (snapshot, history, forecast, Lovelace card data) are
+unauthenticated by design — Lovelace cards hit them cross-origin. CORS
+is allow-listed to same-origin + HA dashboard origins + RFC1918 LAN
+ranges + `*.local` on ports 8123/8787.
 
 ## Troubleshooting
 

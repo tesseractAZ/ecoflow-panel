@@ -5,7 +5,10 @@ Delta Pro Ultra inverters, Delta/River 3 Plus UPS units, EV charger). Talks to
 the EcoFlow IoT Open API (HMAC-SHA256-signed REST polling + MQTT live
 telemetry), persists per-metric history to SQLite, and serves a React
 dashboard with learned anomaly detection, day-ahead forecasting, and per-pack
-capacity-fade → end-of-life projection.
+capacity-fade → end-of-life projection. Also publishes 22+ entities into
+Home Assistant via MQTT Discovery, ships 9 Lit-based HACS Lovelace cards,
+and includes a klaxon/TTS broadcast subsystem with off-grid (no-Cloud-TTS)
+mode.
 
 This repo is **also a Home Assistant add-on** — see below.
 
@@ -168,21 +171,23 @@ production vs development to keep the PR list short.
   glossary hover tooltips on every metric label.
 - **Phase 6** — Home Assistant add-on packaging (this repo, multi-arch
   GHCR images, one-click release pipeline, Dependabot).
-- **Phase 7** — Home Assistant entities integration via `/api/ha-state` —
-  ~13 sensors + 1 binary_sensor surfaced through HA's `rest:` integration
-  (backup pool %, panel load, AC import, off-grid status, forecast,
-  soonest-EOL, alert counts, peer outliers). See `DOCS.md` →
-  "Home Assistant entities" for the copy-pasteable `configuration.yaml`
-  snippet and example automations.
+- **Phase 7** — Home Assistant entities via **MQTT Discovery** —
+  22+ sensors + 1 binary_sensor auto-registered under one "EcoFlow Panel"
+  device (backup pool %, panel load, AC import, off-grid status, day-ahead
+  forecast, soonest-EOL, alert counts, peer outliers, per-circuit lifetime
+  kWh, etc.). Energy Dashboard wiring is plug-and-play. The legacy
+  REST-sensor YAML approach still works for existing installs but is
+  deprecated as of v0.9.68. See `DOCS.md` → "Home Assistant entities".
 
 ## Roadmap
 
-### Shipped through v0.9.3
+### Shipped through v0.9.68
 
 The original roadmap (v0.7.0 / v0.8.0+ / external + infrastructure) and
-two follow-on series (predictive-engine v2, polish + tests) are all
-shipped. Highlights — see [CHANGELOG.md](CHANGELOG.md) for the per-
-release breakdown:
+multiple follow-on series (predictive-engine v2, polish + tests, HACS
+Lovelace cards, security hardening, broadcast/TTS robustness, engine
+audit + test backfill) are all shipped. Highlights — see
+[CHANGELOG.md](CHANGELOG.md) for the per-release breakdown:
 
 **Predictive engine** — peer-comparison anomaly, self-baseline anomaly,
 day-ahead forecast (cloud-aware + day-of-week-aware load + 3-day horizon
@@ -208,12 +213,46 @@ auto-downgrade (info-silencing, warning→info demotion, chronic-noise
 silencing).
 
 **Plumbing** — Node 22 + Fastify + node:sqlite + tsx, native ARM64 CI
-build pipeline (1m 30s end-to-end), 48-test CI gate that blocks bad
+build pipeline (1m 30s end-to-end), 309-test CI gate that blocks bad
 releases, PWA-installable web UI with route-level code splitting
 (60 kB initial JS), persistent lifetime energy accumulator that
 survives recorder pruning + restarts, telnet TUI for terminal monitoring,
 per-SN connectivity logging, EcoFlow-zombie detection with actionable
 fix steps in offline alerts.
+
+**HACS Lovelace cards (v0.9.50–v0.9.55)** — 9 Lit-based cards (fleet,
+alerts, battery, solar, strategy, insights, circuit, broadcast, stats)
+served directly from the add-on at
+`http://homeassistant.local:8787/lovelace/<card>.js`. Add as Lovelace
+resources without HACS, or install via HACS — both URLs work.
+
+**Security hardening (v0.9.60)** — write-auth token model + CSRF
+protection + CORS allow-list. 11 write endpoints require one of:
+HA Ingress header, same-origin, or `X-Panel-Write-Token` (auto-
+generated at `/data/panel-write-token.txt`, mode 0600). The
+`send-command` debug path adds constant-time token compare, per-SN
+cooldown, `cmdSet` allow-list, and payload-shape caps.
+
+**Broadcast / TTS robustness (v0.9.63, v0.9.65)** — TTS language-format
+retry chain (`en-US` → `en_US` → no-language) auto-recovers from the
+Wyoming/Cloud format mismatch; new `BROADCAST_TTS_REQUIRE_LOCAL`
+option enforces no-Cloud-TTS for off-grid setups; explicit
+`BROADCAST_TTS_SERVICE` pin now disables the fallback chain.
+
+**MPC dispatch fix (v0.9.64)** — `simulateHour()` now actually applies
+the explicit battery-flow component for `dischargeMax`,
+`chargeFromGrid`, and `idleHold` actions; previously the DP optimizer
+couldn't distinguish them from `idleHold` and never selected them.
+
+**Engine audit + test backfill (v0.9.58, v0.9.59, v0.9.61, v0.9.67,
+v0.9.68)** — 14 correctness fixes across Kalman, Bayes, MPC, and
+EV-window engines; 309-test suite gating every release; MPC test
+determinism via injectable `nowMs`; MQTT Discovery dedup with
+regression-guard tests.
+
+**Entity registry hygiene (v0.9.68)** — REST sensors path deprecated.
+MQTT Discovery is the canonical surface, with a one-shot retained-empty
+sweep that prunes historical-mistake double-prefixed `unique_id`s.
 
 ### Held until requested
 
@@ -255,3 +294,21 @@ generate:
 
 - **WAVE 2 / Smart Generator schemas** — proper projections when those
   come online via the EcoFlow IoT Open API.
+- **Broadcast / TTS subsystem refactor** — the
+  `broadcast.ts` + `ttsService.ts` + `haService.ts` paths accumulated
+  workarounds across v0.9.18 → v0.9.65 (MA `media_stop` pre-flight,
+  `tts_proxy` URL handoff, klaxon settle timers, language-format
+  retry chain, no-cloud gating). Many were defensive responses to bugs
+  that have since been fixed upstream (MA queue races, Wyoming locale
+  parsing, Piper 500s). Worth a clean-room redesign that:
+    1. Picks one canonical broadcast target representation
+       (deduplicate the MA/Sonos/apple_tv pairings — the operator currently has
+       three device-registry duplicates that the broadcast code papers
+       over),
+    2. Collapses the MA / `media_player` backend selector into a single
+       service-call path with a thin compatibility shim,
+    3. Drops the settle timers in favor of HA-event-driven sequencing
+       (`media_player.state == playing` → fire next), and
+    4. Replaces the TTS engine-pick fallback chain with a small
+       provider interface tested against Piper / Cloud / Google in
+       isolation. Bundle the cleanup as a single ~v0.10 release.
