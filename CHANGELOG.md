@@ -3,6 +3,56 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.82 — 2026-05-31
+
+**Cache-warmer slow cycles, fixed properly this time (benchmark-verified).**
+
+The fresh 42→1.8h production log proved v0.9.80's cache-warmer "fix" (B)
+**did nothing** — slow cycles still 4.5–5.7 s every 4 min on v0.9.81. The
+"400-day dead scan" theory was wrong (scanning an empty index range past
+the 30-day retention is nearly free). So this time I built a benchmark
+against a realistic 3.7M-row / 30-day DB and *measured* before shipping.
+
+### What the benchmark showed (and the agents got wrong)
+
+A true production warm cycle (reset once, run in order):
+`self-consumption 229ms + round-trip-eff 178ms + tariff 32ms +
+curtailment 39ms`, **carbon 0ms** (it reuses the warm self-consumption
+cache — the "duplicate walk" was a benchmark artifact), ≈479ms on SSD →
+~3–4.5 s on the Pi's slow disk. So:
+- It's **I/O-bound, not CPU-bound** — `integrateWhSorted` (the agents'
+  proposed micro-opt) would have been another non-fix; tariff is 32ms.
+- Real cost = self-consumption + RTE **both recomputing every cycle**.
+
+### The fix: stagger the heavy recomputes
+
+The warmer reset all five short-lived caches every cycle, forcing SC +
+RTE to re-walk 7 days of pack history every 4 min. Now:
+- Clipping (fc-derived, ~0ms) still refreshes every cycle.
+- The three heavy groups — `{self-consumption + carbon}`, `RTE`,
+  `tariff` — **rotate one per cycle**.
+- Their TTLs go 5→15 min so each refreshes every ~12 min (3 groups ×
+  4-min interval), comfortably inside the TTL → **no v0.9.11 cold
+  window**. Curtailment's TTL goes 1→5 min (the 7-day walk is its cost;
+  the alert monitor reads the cache and 5-min freshness is fine).
+
+**Benchmark-verified result: worst staggered cycle 199ms vs 475ms
+(−58%) → on the Pi ~1.3 s vs ~3.1 s.** The >3s slow-cycle log line
+should stop firing. HA sensors (carbon/tariff/RTE/self-consumption are
+7-day rolling aggregates) at ≤15-min freshness — imperceptible.
+
+### Tests
+
+2 stagger-isolation tests (`analytics.test.ts`, 333 total): resetting
+one scoped group must not clear another, so the rotation actually
+spreads the work.
+
+### Files touched
+
+`server/src/analytics.ts` (TTL bumps + 4 scoped resetters),
+`server/src/cacheWarmer.ts` (rotation), `server/test/analytics.test.ts`,
+`CHANGELOG.md`, `config.yaml`.
+
 ## 0.9.81 — 2026-05-31
 
 **Follow-up to v0.9.80(A): MPPT error guard is now watt-based.**

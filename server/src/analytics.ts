@@ -1717,7 +1717,13 @@ export function computeRunway(
  * contaminate the ratio. Cached ~5 min.
  * =================================================================== */
 
-const RTE_TTL_MS = 5 * 60 * 1000;
+// v0.9.82 — 15 min (was 5). The cache-warmer staggers the heavy recomputes
+// (this + self-consumption + tariff) one group per 4-min cycle, so each
+// refreshes every ~12 min; a 15-min TTL keeps that inside the window (no
+// v0.9.11 cold window) while letting the warmer recompute it on only 1 in 3
+// cycles instead of every cycle. RTE is a 7-day rolling aggregate feeding an
+// HA sensor — 15-min freshness is ample.
+const RTE_TTL_MS = 15 * 60 * 1000;
 
 export interface RoundTripDay {
   date: string;
@@ -3003,7 +3009,7 @@ export function computeConfidenceSnapshot(
  * Rolling 7-day window by default. Cached 5 min.
  * =================================================================== */
 
-const SELF_CONSUMPTION_TTL_MS = 5 * 60 * 1000;
+const SELF_CONSUMPTION_TTL_MS = 15 * 60 * 1000; // v0.9.82 — staggered warm; 7-day aggregate, 15-min freshness ample
 
 export interface SelfConsumption {
   generatedAt: number;
@@ -3672,7 +3678,7 @@ export interface CurtailmentReport {
   opportunisticLoads: OpportunisticLoad[];
 }
 
-const CURTAIL_TTL_MS = 60 * 1000;            // 1 min — short, real-time tile
+const CURTAIL_TTL_MS = 5 * 60 * 1000;         // v0.9.82 — 5 min (was 1). The 7-day history walk is the cost; the alert monitor reads this cache, 5-min freshness is fine and halves its recompute frequency.
 const CURTAIL_MIN_PV_W = 200;                // panels actually producing
 const CURTAIL_MIN_SURPLUS_W = 300;           // meaningful gap before we call it curtailment
 const CURTAIL_MIN_GHI_WM2 = 100;             // daylight floor
@@ -4211,7 +4217,7 @@ export async function getActiveNwsAlerts(): Promise<NwsAlert[]> {
  * GRID_CO2_INTENSITY_LB_PER_MWH.
  * =================================================================== */
 
-const CARBON_TTL_MS = 5 * 60 * 1000;
+const CARBON_TTL_MS = 15 * 60 * 1000; // v0.9.82 — reuses self-consumption; staggered with it
 const DEFAULT_GRID_CO2_LB_PER_MWH = Number(process.env.GRID_CO2_INTENSITY_LB_PER_MWH ?? 1100);
 // 1 lb/MWh = 0.4536 kg / 1000 kWh = 0.0004536 kg/kWh
 const LB_PER_MWH_TO_KG_PER_KWH = 0.4536 / 1000;
@@ -4283,7 +4289,7 @@ export function computeCarbonReport(
  * TARIFF_ON_PEAK_HOURS=15-20 + TARIFF_ON_PEAK_DAYS=1-5 to match.
  * =================================================================== */
 
-const TARIFF_TTL_MS = 5 * 60 * 1000;
+const TARIFF_TTL_MS = 15 * 60 * 1000; // v0.9.82 — staggered warm; 7-day cost aggregate
 // v0.9.58 — default to a FLAT rate (the operator's APS plan is flat $0.17/kWh — no TOU
 // split). The prior 25¢/8¢ split implied a TOU plan most APS customers don't
 // have, which silently overstated both grid-import cost and solar-load value
@@ -5499,6 +5505,24 @@ export function resetHaStateShortLivedCaches(): void {
   clippingCache = null;
   carbonCache = null;
   tariffCache = null;
+}
+
+/* v0.9.82 — scoped resetters so the cache-warmer can STAGGER the heavy
+ * recomputes instead of nulling all five every cycle. Benchmark (3.7M-row
+ * 30-day DB) showed a real warm cycle = self-consumption 229ms + RTE 178ms +
+ * tariff 32ms + curtailment 39ms (carbon reuses the warm self-consumption
+ * cache → ~0ms), ≈479ms on SSD → ~3-4.5s on the Pi's slow disk. Clipping is
+ * fc-derived (~0ms) so it stays every-cycle; the three heavy groups rotate
+ * one per cycle. Paired with the 15-min TTLs, each refreshes every ~12 min
+ * (no v0.9.11 cold window) and no single cycle re-walks all of them. */
+export function resetClippingCache(): void { clippingCache = null; }
+export function resetRteCache(): void { rteCache = null; }
+export function resetTariffCache(): void { tariffCache = null; }
+/** Carbon recomputes self-consumption internally; null both so carbon
+ *  re-pulls the freshly-warmed self-consumption rather than a stale one. */
+export function resetSelfConsumptionCache(): void {
+  selfConsumptionCache = null;
+  carbonCache = null;
 }
 
 /** Test-only seam: clear forecast-related caches so each test starts cold. */

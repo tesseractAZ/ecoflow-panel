@@ -7,6 +7,8 @@ import {
   forecastDayAlerts,
   resetHaStateShortLivedCaches,
   resetForecastCachesForTesting,
+  resetRteCache,
+  resetSelfConsumptionCache,
   computeBaselineAlerts,
   computeRoundTripEfficiency,
   computeSelfConsumption,
@@ -375,4 +377,44 @@ test('computeBaselineAlerts — genuinely stuck-on circuit DOES flag (sustained)
   const alerts = loadAlerts(shp2LoadDevice('East Air conditioner', 3200), rec);
   assert.equal(alerts.length, 1);
   assert.match(alerts[0].title, /unusual for the hour/);
+});
+
+/* ===================================================================
+ * v0.9.82 — scoped cache resetters must be INDEPENDENT so the cache-
+ * warmer can stagger the heavy recomputes (self-consumption + RTE +
+ * tariff) one group per cycle instead of nulling all five every cycle.
+ * Benchmark proved this cuts the per-cycle synchronous DB burst ~58%
+ * (475ms→199ms on SSD; ~3.1s→~1.3s on the Pi). This guards the
+ * mechanism: resetting one group must NOT clear another.
+ * =================================================================== */
+test('resetRteCache clears RTE but leaves self-consumption warm (stagger isolation)', () => {
+  const rec = mockRecorder();
+  const fleet = fakeDpuFleet();
+  resetHaStateShortLivedCaches();
+  computeSelfConsumption(fleet, rec);          // warm SC
+  computeRoundTripEfficiency(fleet, rec);      // warm RTE
+  const afterWarm = rec.queryMultiCount;
+
+  resetRteCache();                             // scoped: RTE only
+  computeSelfConsumption(fleet, rec);          // must stay cached → no new queries
+  assert.equal(rec.queryMultiCount, afterWarm, 'self-consumption stays warm after resetRteCache');
+
+  computeRoundTripEfficiency(fleet, rec);      // RTE was cleared → recomputes
+  assert.ok(rec.queryMultiCount > afterWarm, 'RTE recomputes after resetRteCache');
+});
+
+test('resetSelfConsumptionCache clears SC but leaves RTE warm (stagger isolation)', () => {
+  const rec = mockRecorder();
+  const fleet = fakeDpuFleet();
+  resetHaStateShortLivedCaches();
+  computeRoundTripEfficiency(fleet, rec);      // warm RTE
+  computeSelfConsumption(fleet, rec);          // warm SC
+  const afterWarm = rec.queryMultiCount;
+
+  resetSelfConsumptionCache();                 // scoped: SC (+carbon) only
+  computeRoundTripEfficiency(fleet, rec);      // must stay cached → no new queries
+  assert.equal(rec.queryMultiCount, afterWarm, 'RTE stays warm after resetSelfConsumptionCache');
+
+  computeSelfConsumption(fleet, rec);          // SC was cleared → recomputes
+  assert.ok(rec.queryMultiCount > afterWarm, 'self-consumption recomputes after resetSelfConsumptionCache');
 });

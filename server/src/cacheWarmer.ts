@@ -23,7 +23,10 @@ import {
   computeEvWindowPrediction,
   computeChargeCurveFingerprint,
   computeInternalResistance,
-  resetHaStateShortLivedCaches,
+  resetClippingCache,
+  resetRteCache,
+  resetTariffCache,
+  resetSelfConsumptionCache,
 } from './analytics.js';
 import { computeRepairIssues } from './repairIssues.js';
 import { computeTotals, startOfLocalDayMs } from './aggregator.js';
@@ -72,6 +75,7 @@ export function startCacheWarmer(
 ): CacheWarmerHandle {
   let stopped = false;
   let inFlight = false;
+  let warmCycle = 0;   // v0.9.82 — rotates the staggered slow-report resets
   const timings: Record<string, number> = {};
 
   /** Run one task, catch + log errors, record wall time on success. */
@@ -101,7 +105,21 @@ export function startCacheWarmer(
       // v0.9.11 — clear the short-TTL caches so the subsequent computes
       // actually do the work instead of returning still-warm values
       // without restamping `ts`. See the file-level note for the bug.
-      resetHaStateShortLivedCaches();
+      //
+      // v0.9.82 — but DON'T clear all five every cycle. Benchmark + 42h logs
+      // proved self-consumption (~230ms) + RTE (~178ms) dominate and BOTH
+      // recomputed every 4-min cycle, producing a ~4.5s synchronous block on
+      // the Pi's slow disk (the event loop — MQTT/HTTP/telnet — froze for it).
+      // Clipping is fc-derived (~0ms) so refresh it every cycle; the three
+      // heavy groups rotate ONE per cycle. With their TTLs at 15 min each
+      // group still refreshes every ~12 min (3 groups × 4-min interval) —
+      // inside the TTL, so no v0.9.11 cold window — and no single cycle
+      // re-walks all three. Carbon reuses the warm self-consumption cache,
+      // so grouping it there keeps it ~free.
+      resetClippingCache();
+      const slowGroupResets = [resetSelfConsumptionCache, resetRteCache, resetTariffCache];
+      slowGroupResets[warmCycle % slowGroupResets.length]();
+      warmCycle++;
       // v0.9.49 — Parallelized: the previous serial sequence was 21
       // `await safe(...)` calls in a chain. Log analyst measured slow
       // cycles dominated by 3 offenders (self-consumption ~1100ms,
