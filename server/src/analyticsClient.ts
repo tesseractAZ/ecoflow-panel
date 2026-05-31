@@ -45,20 +45,14 @@ export function createAnalyticsClient(dbPath: string, log: (m: string) => void):
   let lastSnapshot: FleetSnapshot | null = null;
   let dirty = false;
 
-  const workerUrl = new URL('./analyticsWorker.ts', import.meta.url);
+  // Spawn the .mjs bootstrap (loads natively), which registers tsx's loader
+  // in the worker thread and then imports the real .ts worker. See
+  // analyticsWorkerBootstrap.mjs — `execArgv: ['--import','tsx']` was not
+  // enough on the container's tsx version.
+  const workerUrl = new URL('./analyticsWorkerBootstrap.mjs', import.meta.url);
 
   const spawn = () => {
-    worker = new Worker(workerUrl, {
-      workerData: { dbPath },
-      // tsx's ESM loader does NOT auto-propagate into worker threads in every
-      // runtime. It does on macOS dev (the worker inherits the parent's
-      // execArgv), but NOT in the HA add-on container — there the server is
-      // started via `npm start` → `tsx src/index.ts` and the worker came up
-      // with "Unknown file extension .ts", crash-looping. Register tsx
-      // explicitly per the tsx worker_threads docs. tsx is a runtime dep, so
-      // the bare `tsx` specifier resolves from node_modules in both envs.
-      execArgv: ['--import', 'tsx'],
-    });
+    worker = new Worker(workerUrl, { workerData: { dbPath } });
     worker.on('message', (msg: any) => {
       if (msg?.kind === 'log') { log(msg.message); return; }
       if (msg?.kind === 'ready') {

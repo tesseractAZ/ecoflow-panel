@@ -3,6 +3,26 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.10.2 — 2026-05-31
+
+**Hotfix #2: load the worker via a .mjs bootstrap that registers tsx's loader.**
+
+v0.10.1's `execArgv: ['--import', 'tsx']` did NOT fix the container crash-loop
+— on the container's tsx version, a bare `--import tsx` doesn't self-register
+the ESM loader (that auto-register was added in a later tsx; the image's
+`^4.19.2` predates it). The worker kept exiting with `Unknown file extension
+".ts"`.
+
+Robust fix: the Worker now spawns a **.mjs bootstrap**
+(`analyticsWorkerBootstrap.mjs`) instead of the .ts directly. Node loads .mjs
+natively (no loader needed); the bootstrap then registers tsx's loader for the
+worker thread via `node:module` `register('tsx/esm', …)` (node ≥ 20.6 — the
+container runs node 22), with a fallback to tsx's own `tsx/esm/api` register(),
+and finally imports the real `analyticsWorker.ts`. This relies on the standard
+loader-registration API rather than the fragile execArgv-inheritance / bare
+`--import tsx` behavior that differs between macOS dev and the container.
+Verified with the real worker locally.
+
 ## 0.10.1 — 2026-05-31
 
 **Hotfix: register tsx in the analytics worker thread (container crash-loop).**
