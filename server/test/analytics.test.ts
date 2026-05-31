@@ -9,12 +9,15 @@ import {
   resetForecastCachesForTesting,
   resetRteCache,
   resetSelfConsumptionCache,
+  windowedEnergyWh,
+  resetDailyEnergyCache,
   computeBaselineAlerts,
   computeRoundTripEfficiency,
   computeSelfConsumption,
   computeEquipmentHealth,
   type DayForecast,
 } from '../src/analytics.js';
+import { integrateWh, startOfLocalDayMs } from '../src/aggregator.js';
 import type { Recorder } from '../src/recorder.js';
 import type { DeviceSnapshot } from '../src/snapshot.js';
 
@@ -277,18 +280,26 @@ test('computeRoundTripEfficiency — query count is O(dpus × packs), not O(days
   assert.equal(rec.queryCount, 0, 'RTE should not use the per-metric query() path anymore');
 });
 
-test('computeSelfConsumption — query count is O(dpus), not O(dpus × metricsPerDpu)', () => {
-  resetHaStateShortLivedCaches();
+test('computeSelfConsumption — batched per device-segment + day-memoized warm reuse', () => {
+  // v0.9.84 — SC now integrates via windowedEnergyWh: per-calendar-day
+  // memoization. Cold scan = O(dpus × day-segments) but STILL batched
+  // (one queryMulti carries all ~12 metrics per device per segment — not
+  // one query per metric, which would be ~12× more). After warming, the
+  // completed interior days are served from cache, so a result-cache reset
+  // re-scans only the two boundary partials.
+  resetForecastCachesForTesting();   // clears SC result cache AND the day-energy memo
   const rec = mockRecorder();
   const devices = fakeDpuFleet(4, 5);
-  computeSelfConsumption(devices, rec);
-  // Was 49 queries (1 per metric per DPU + 1 SHP2 panel_load).
-  // New: ≤ 1 queryMulti per DPU + 1 query() for panel_load (no SHP2 in
-  // this synthetic fleet, so 0 panel_load queries).
-  assert.ok(
-    rec.queryMultiCount <= 4,
-    `self-consumption made ${rec.queryMultiCount} queryMulti calls; budget is ≤ 4`,
-  );
+  computeSelfConsumption(devices, rec);                 // cold — fills day cache
+  const cold = rec.queryMultiCount;
+  // Batched: 4 DPUs × ≤8 day-segments. Per-metric would be ×12 (~384).
+  assert.ok(cold > 0 && cold <= 4 * 9, `cold is batched per device-segment (${cold} ≤ 36)`);
+
+  resetSelfConsumptionCache();                          // force result recompute, KEEP day cache
+  computeSelfConsumption(devices, rec);                 // reuses cached interior days
+  const warm = rec.queryMultiCount - cold;
+  assert.ok(warm < cold, `warm SC reuses cached days, fewer queries than cold (${warm} < ${cold})`);
+  assert.ok(warm <= 4 * 2, `warm re-scans only the 2 boundary partials per DPU (${warm} ≤ 8)`);
 });
 
 test('computeEquipmentHealth — query count bounded; 5-min bucketing in use', () => {
@@ -417,4 +428,69 @@ test('resetSelfConsumptionCache clears SC but leaves RTE warm (stagger isolation
 
   computeSelfConsumption(fleet, rec);          // SC was cleared → recomputes
   assert.ok(rec.queryMultiCount > afterWarm, 'self-consumption recomputes after resetSelfConsumptionCache');
+});
+
+/* ===================================================================
+ * v0.9.84 — windowedEnergyWh per-day memoization. Must (a) match the
+ * whole-window integral (energy accounting can't drift), (b) reuse
+ * cached completed days so a warm call issues far fewer SQL queries,
+ * and (c) re-query after a reset. This is what takes self-consumption
+ * from ~1.9s to ~0.26s on the Pi without changing the numbers.
+ * =================================================================== */
+function energyRecorder(): Recorder & { queryMultiCount: number } {
+  let n = 0;
+  // Smooth, deterministic signal so trapezoidal integration is stable.
+  const f = (ts: number) => 1000 + 500 * Math.sin(ts / 5_000_000);
+  return {
+    insertSnapshot: () => {},
+    query: () => [],
+    queryMulti: (_sn, metrics, since, until, bucketSec) => {
+      n++;
+      const step = (bucketSec ?? 300) * 1000;
+      const m = new Map<string, Array<{ ts: number; value: number }>>();
+      for (const metric of metrics) {
+        const pts: Array<{ ts: number; value: number }> = [];
+        for (let t = Math.ceil(since / step) * step; t <= until; t += step) pts.push({ ts: t, value: f(t) });
+        m.set(metric, pts);
+      }
+      return m;
+    },
+    listMetrics: () => [],
+    close: () => {},
+    rollupLifetime: () => {},
+    getLifetimeTotals: () => ({}),
+    get queryMultiCount() { return n; },
+  } as Recorder & { queryMultiCount: number };
+}
+
+test('windowedEnergyWh — matches whole-window integral, memoizes completed days', () => {
+  resetDailyEnergyCache();
+  const rec = energyRecorder();
+  const now = startOfLocalDayMs() + 14 * 3_600_000;  // today 14:00 local
+  const since = now - 7 * 86_400_000;
+  const todayStart = startOfLocalDayMs();
+
+  // Whole-window reference.
+  const whole = integrateWh(rec.queryMulti('SN', ['pv'], since, now, 300).get('pv')!, since, now).wh;
+  const qRef = rec.queryMultiCount;
+
+  // Day-cached cold (fills the per-day cache).
+  const cold = windowedEnergyWh(rec, 'SN', ['pv'], since, now, 300, todayStart).get('pv')!;
+  const qAfterCold = rec.queryMultiCount;
+  // Day-cached warm (interior days served from cache).
+  const warm = windowedEnergyWh(rec, 'SN', ['pv'], since, now, 300, todayStart).get('pv')!;
+  const qAfterWarm = rec.queryMultiCount;
+
+  assert.ok(Math.abs(whole - cold) / whole < 0.01,
+    `day-cached within 1% of whole-window (${whole.toFixed(0)} vs ${cold.toFixed(0)})`);
+  assert.equal(cold, warm, 'warm call returns identical energy');
+  const coldQ = qAfterCold - qRef;
+  const warmQ = qAfterWarm - qAfterCold;
+  assert.ok(warmQ < coldQ, `warm issues fewer queries than cold (${warmQ} < ${coldQ})`);
+  assert.ok(warmQ <= 2, `warm only re-scans the boundary partials (${warmQ} ≤ 2)`);
+
+  // Reset forces full re-query.
+  resetDailyEnergyCache();
+  windowedEnergyWh(rec, 'SN', ['pv'], since, now, 300, todayStart);
+  assert.ok(rec.queryMultiCount - qAfterWarm > warmQ, 'reset re-queries the previously-cached days');
 });

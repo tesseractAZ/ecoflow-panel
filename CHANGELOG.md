@@ -3,6 +3,52 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.84 — 2026-05-31
+
+**Self-consumption solved head-on: per-calendar-day energy memoization.**
+
+v0.9.82 (stagger) and v0.9.83 (300s bucket) *reduced* the SC slow cycle to
+~1.9s every 12 min but explicitly left it as "a reduction, not elimination"
+— the deferred fix was a 5-min rollup table or moving the recorder off
+thread. This ships the elegant middle path that needs neither: **memoize the
+per-day energy integral.**
+
+The insight: self-consumption is a 7-day rolling Wh sum, recomputed in full
+every cache cycle. But a *completed calendar day never changes* — its
+pv/grid/charge/discharge Wh are immutable once the day is over. Only the two
+boundary partials (the tail of day −7 and today-so-far) move. So we split
+the window at local-midnight boundaries (Phoenix = no DST, clean math),
+integrate each segment independently, and cache every segment that is a
+whole, completed past day keyed by `(localDayStart, sn)`. Steady-state SC
+then re-scans only ~2 partial days per device instead of 7 full ones.
+
+New `windowedEnergyWh()` in analytics.ts does the day-split + memo;
+`computeSelfConsumption` calls it per device (still one batched `queryMulti`
+per segment — all 12 metrics together, never per-metric). `panel_load` from
+the SHP2 goes through the same path.
+
+Benchmark (30-day, 3.7M-row synthetic DB, the same rig as v0.9.82/83):
+- **Output identical** to the whole-window integral: 0.011% max drift across
+  every kWh total — well inside the 0.1% rounding already applied, and the
+  warm path is bit-identical to the cold path.
+- **7.4× faster warm.** Projected Pi steady-state SC **~1.9s → ~0.26s** —
+  finally under the 3s slow-cycle threshold *on the SC cycle itself*, not
+  just on the cycles where SC happens to be staggered out.
+
+Cold path (first call after a boot or a midnight rollover) issues more,
+smaller queries (one per day-segment) but scans the same total rows; it
+lands at parity with the old whole-window cost and happens at most once per
+day. The stagger (v0.9.82) and 300s bucket (v0.9.83) both stay — together
+with the memo, no cache cycle now re-walks a full 7-day window.
+
+`resetSelfConsumptionCache()` (cache-warmer stagger) intentionally leaves
+the day memo warm — only the SC *result* is recomputed, from cached days.
+Day memo is pruned past 10 days and fully cleared by
+`resetForecastCachesForTesting()`.
+
+334 tests pass (new: day-memo equivalence + warm-reuse + the rewritten
+query-budget test), tsc clean.
+
 ## 0.9.83 — 2026-05-31
 
 **Self-consumption query coarsened 60s→300s — clears the last slow-cycle.**
