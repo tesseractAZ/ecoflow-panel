@@ -3,6 +3,30 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.81 — 2026-05-31
+
+**Follow-up to v0.9.80(A): MPPT error guard is now watt-based.**
+
+Verifying v0.9.80 live caught a residual: at sunset every core reported
+HV err=457 / LV err=177 *simultaneously* with strings winding down — these
+are EcoFlow's benign standby/shutdown codes (a real fault can't be
+identical across three independent units). v0.9.80's amp-floor (0.1 A)
+suppressed 5 of 6, but one HV string drew a **0.275 A shutdown trickle at
+0 W**, slipped above the floor, and fired a phantom alert.
+
+- **alerts.ts**: the "producing" guard is now **watt-based** (>20 W) rather
+  than amp-based. A string at ~0 W is idle/shedding/shutting-down
+  regardless of residual current, so any code is benign standby.
+- **web SolarPanel.tsx `channelState`**: same bug existed in the UI — it
+  checked `errCode` *first*, so at sunset every MPPT tile would flash a red
+  "fault" badge. Now a code is only `fault` when the string is actually
+  producing (watt-based); an idle string carrying a standby code shows
+  `idle`, not `fault`. Keeps the tile and the alert consistent.
+
+One new test (`alertsMppt.test.ts`) pins the exact sunset-trickle case
+(0 W / 164 V / 0.275 A / code 457 → suppressed). 331 tests pass, both
+packages type-check clean.
+
 ## 0.9.80 — 2026-05-31
 
 **Log-driven fixes from a 42-hour production log (5 issues investigated

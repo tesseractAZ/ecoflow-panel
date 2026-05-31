@@ -53,9 +53,17 @@ test('MPPT alert STILL FIRES on a real fault while producing current', () => {
   assert.equal(hasHvErr(dpuWith({ pvHighErrCode: 5, pvHighVolts: 380, pvHighAmps: 4.2, pvHighWatts: 1596 })), true);
 });
 
-test('MPPT alert SUPPRESSED when lit but current below the 0.1 A floor', () => {
-  // Edge: voltage present, trickle of noise current under the floor → idle, not fault.
+test('MPPT alert SUPPRESSED when lit but producing ~0 W (idle/shed)', () => {
+  // Edge: voltage present, trickle of noise current, but 0 W → idle, not fault.
   assert.equal(hasHvErr(dpuWith({ pvHighErrCode: 5, pvHighVolts: 130, pvHighAmps: 0.05, pvHighWatts: 0 })), false);
+});
+
+test('MPPT alert SUPPRESSED on sunset shutdown trickle (0 W, 0.275 A above old amp floor)', () => {
+  // The exact live false-positive that slipped through the v0.9.80 amp floor:
+  // Core 2 HV at sunset — 0 W, 164 V, 0.275 A (> 0.1 A), code 457. All cores
+  // reported identical 457/177 codes simultaneously = benign standby, not a
+  // fault. The watt floor (v0.9.81) catches it: 0 W → not producing.
+  assert.equal(hasHvErr(dpuWith({ pvHighErrCode: 457, pvHighVolts: 164, pvHighAmps: 0.275, pvHighWatts: 0 })), false);
 });
 
 test('MPPT alert not raised at all when code is zero (baseline)', () => {

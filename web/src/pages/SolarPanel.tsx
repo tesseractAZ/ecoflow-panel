@@ -513,24 +513,34 @@ function DpuSolarCard({ d }: { d: DeviceSnapshot & { projection: DpuProjection }
 }
 
 /**
- * Classify an MPPT channel's operating state from V/A/errCode so the tile
- * can explain a 0 W reading instead of looking broken (v0.9.79).
+ * Classify an MPPT channel's operating state from W/V/errCode so the tile
+ * can explain a 0 W reading instead of looking broken (v0.9.79; watt-based
+ * + fault-only-when-producing since v0.9.81).
  *
- *  - fault     — error code present
- *  - producing — drawing current (amps above the noise floor)
- *  - idle      — string voltage present but ~0 A. The panels are wired and
- *                showing open-circuit voltage, but the MPPT isn't harvesting.
- *                Almost always means the battery is full/curtailing and the
- *                DPU has backed off this input (it sheds the LV string first).
+ *  - producing — making real WATTS (above the floor).
+ *  - fault     — an error code WHILE producing. A non-zero code on an idle
+ *                string is EcoFlow's benign standby/shutdown status (live
+ *                proof: at sunset every core reported HV=457 / LV=177 with
+ *                strings at 0 W) — that is NOT a fault, so we must not paint
+ *                idle strings red.
+ *  - idle      — string voltage present but ~0 W. Panels wired and showing
+ *                open-circuit voltage, but the MPPT isn't harvesting —
+ *                battery full/curtailing (sheds LV first) or sunset wind-down.
  *  - dark      — no meaningful voltage: night, deep shade, or disconnected.
  */
 const CH_VOLT_PRESENT = 10;   // V — above this the string is "connected/lit"
-const CH_AMP_FLOOR = 0.1;     // A — below this we treat current as zero
+const CH_WATT_FLOOR = 20;     // W — below this the string isn't meaningfully producing
 
 type ChannelState = 'fault' | 'producing' | 'idle' | 'dark';
-function channelState(volts: number | null, amps: number | null, errCode: number | null): ChannelState {
-  if ((errCode ?? 0) !== 0) return 'fault';
-  if (amps != null && amps > CH_AMP_FLOOR) return 'producing';
+function channelState(
+  watts: number | null,
+  volts: number | null,
+  errCode: number | null,
+): ChannelState {
+  const producing = watts != null && watts > CH_WATT_FLOOR;
+  // A code only means "fault" when the string is actually producing — an
+  // idle/dark string carrying a code is in benign standby.
+  if (producing) return (errCode ?? 0) !== 0 ? 'fault' : 'producing';
   if (volts != null && volts > CH_VOLT_PRESENT) return 'idle';
   return 'dark';
 }
@@ -556,7 +566,7 @@ function MpptChannelTile({
   // Effective resistance (V / A) for the operating point — interesting metric for power tracking
   const ohms = volts != null && amps != null && amps > 0.05 ? volts / amps : null;
   const computed = volts != null && amps != null ? volts * amps : null;
-  const state = channelState(volts, amps, errCode);
+  const state = channelState(watts, volts, errCode);
   const badge = CHANNEL_BADGE[state];
   return (
     <div className="bg-panel2/60 border border-line rounded-xl p-3">
