@@ -168,6 +168,17 @@ const BASELINE_TTL_MS = 5 * 60 * 1000;        // recompute at most every 5 min
 const BASELINE_HISTORY_MS = 14 * 24 * 60 * 60 * 1000;
 const BASELINE_MIN_SPAN_MS = 2 * 24 * 60 * 60 * 1000; // need ≥2 days to baseline
 const BASELINE_MIN_SAMPLES = 8;               // min samples in the hour-window
+// v0.9.80 — sustained-excursion gate for duty-cycled load circuits. Bimodal
+// loads (AC compressors) and the May→summer seasonal ramp leave the hour-of-
+// day baseline dominated by the off/low state, so a single instantaneous
+// compressor-on reading lands far outside it and the detector re-fired on
+// every cycle (42h log: "East Air conditioner load unusual for the hour" ×13,
+// West ×8). For flagged load targets, require the excursion to PERSIST across
+// the recent real-time window before flagging: a stuck/faulted circuit holds;
+// a normal compressor cycle does not. Thermal/SoC targets are unaffected.
+const BASELINE_SUSTAINED_MS = 30 * 60 * 1000;   // excursion must hold this long
+const BASELINE_SUSTAINED_FRAC = 0.6;            // ≥60% of recent samples past floor
+const BASELINE_SUSTAINED_MIN_RECENT = 3;        // need ≥N recent samples to gate
 
 interface BaselineTarget {
   sn: string;
@@ -181,6 +192,10 @@ interface BaselineTarget {
   floor: number;                     // min deviation worth flagging (display units)
   transform: (raw: number) => number; // history raw value → display units
   fmt: (v: number) => string;
+  // v0.9.80 — when true, require the excursion to be SUSTAINED over the recent
+  // real-time window (BASELINE_SUSTAINED_MS) before flagging. Set on bursty
+  // duty-cycled SHP2 load circuits so AC compressor cycling doesn't re-fire.
+  sustained?: boolean;
 }
 
 const tempFmt = (v: number) => `${Math.round(v)}°F`;
@@ -204,7 +219,7 @@ function buildBaselineTargets(devices: Record<string, DeviceSnapshot>): Baseline
     } else if (d.projection.kind === 'shp2') {
       const sp = d.projection as Shp2Projection;
       for (const pc of sp.pairedCircuits) {
-        targets.push({ sn: d.sn, metric: `pair${pc.primaryCh}_w`, device: d.deviceName, label: `${pc.name} load`, category: 'SHP2', coreNum: null, packNum: null, live: pc.watts, floor: 500, transform: (x) => x, fmt: wattFmt });
+        targets.push({ sn: d.sn, metric: `pair${pc.primaryCh}_w`, device: d.deviceName, label: `${pc.name} load`, category: 'SHP2', coreNum: null, packNum: null, live: pc.watts, floor: 500, transform: (x) => x, fmt: wattFmt, sustained: true });
       }
       // v0.6.0 — per-circuit baseline anomaly. Skip circuits already covered
       // by a paired-circuit aggregate target. Same robust median+MAD test
@@ -231,6 +246,7 @@ function buildBaselineTargets(devices: Record<string, DeviceSnapshot>): Baseline
           floor: 500,
           transform: (x) => x,
           fmt: wattFmt,
+          sustained: true,
         });
       }
     }
@@ -267,6 +283,26 @@ export function computeBaselineAlerts(devices: Record<string, DeviceSnapshot>, r
     const m = mad(bucket, med);
     const absDev = Math.abs(t.live - med);
     if (absDev < t.floor) continue;
+
+    // v0.9.80 — sustained-excursion gate for bursty load circuits. The hour-of-
+    // day bucket is dominated by the off/low state, so a single compressor-on
+    // reading reads as a huge outlier and re-fires every cycle. Require the
+    // excursion to PERSIST: a majority of the recent real-time samples (NOT the
+    // hour-of-day bucket — the actual last BASELINE_SUSTAINED_MS of readings)
+    // must sit on the same side of the median, past the floor. A stuck/faulted
+    // circuit clears this; a normal AC compressor cycle does not. Filtered by
+    // timestamp so recorder row order is irrelevant.
+    if (t.sustained) {
+      const dirSign = Math.sign(t.live - med);
+      const recent = pts.filter((p) => p.ts >= now - BASELINE_SUSTAINED_MS);
+      if (recent.length >= BASELINE_SUSTAINED_MIN_RECENT) {
+        const agree = recent.filter((p) => {
+          const v = t.transform(p.value);
+          return Number.isFinite(v) && Math.sign(v - med) === dirSign && Math.abs(v - med) >= t.floor;
+        }).length;
+        if (agree < Math.ceil(recent.length * BASELINE_SUSTAINED_FRAC)) continue;
+      }
+    }
 
     const z = m > 0 ? Math.abs((0.6745 * (t.live - med)) / m) : Z_WARN;
     if (z < Z_INFO) continue;
@@ -1073,7 +1109,15 @@ export function forecastDayAlerts(df: DayForecast): Alert[] {
 
 const EOL_SOH = 80;                                          // % — conventional LFP end-of-life
 const DEGRADE_REPORT_TTL_MS = 30 * 60 * 1000;
-const DEGRADE_REPORT_HISTORY_MS = 400 * 24 * 60 * 60 * 1000;  // regress over up to ~13 months
+// v0.9.80 — cap at the recorder's 30-day retention (recorder.ts RETAIN_MS).
+// The samples table is pruned to 30 days, so any window beyond that is pure
+// dead index-scan range — the SoH regression has no rows older than 30 days
+// to fit. The previous 400-day lower bound made degradation scan ~370 days of
+// empty range per pack, every cache cycle; on a synchronous SQLite store this
+// serialized the cache-warmer's "parallel" cohort (runway + RTE + degradation
+// all blocked on it), producing the 4-5.6 s slow cycles in the 42h log. Output
+// is byte-for-byte identical (no rows beyond 30 days exist to regress).
+const DEGRADE_REPORT_HISTORY_MS = 30 * 24 * 60 * 60 * 1000;   // = recorder RETAIN_MS
 const DEGRADE_BUCKET_SEC = 6 * 3600;                          // 6-hour buckets — de-noise SoH jitter
 const EOL_MIN_SPAN_MS = 7 * 24 * 60 * 60 * 1000;              // ≥1 week of data before dating an EOL
 const EOL_MIN_R2 = 0.3;                                       // trend must explain ≥30% of variance
@@ -5466,6 +5510,7 @@ export function resetForecastCachesForTesting(): void {
   ambientThermalCache = null;
   dispatchCache = null;
   curtailmentCache = null;
+  baselineCache = null;
 }
 
 /** Test-only seam: pin a Bayesian model into the cache so computeCurtailment

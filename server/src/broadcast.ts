@@ -67,7 +67,7 @@
 
 import type { SnapshotStore } from './snapshot.js';
 import type { Alert } from './alerts.js';
-import { callHaService, isSupervised, hasService } from './haService.js';
+import { callHaService, isSupervised, probeService } from './haService.js';
 import { parseQuietHours, inQuietWindow } from './alertMonitor.js';
 import { renderAnnouncement, pruneRenderCache } from './audioRenderer.js';
 import { buildAlertMessage } from './ttsService.js';
@@ -212,16 +212,41 @@ export function startBroadcastMonitor(
     log(`broadcast: enabled, ${cfg.targets.length} target(s): ${cfg.targets.join(', ')}`);
   }
 
-  const detectMusicAssistant = async () => {
+  // v0.9.80 — avoid a startup false-negative. At boot the Supervisor proxy /
+  // Core service registry may not be ready, so the services-catalog fetch
+  // fails and looks identical to "MA not installed". probeService() returns
+  // 'unknown' for a failed/early fetch (vs 'absent' for a confirmed-empty
+  // catalog), so we only emit the alarming "broadcasts will fail" line on a
+  // CONFIRMED absence. Transient 'unknown' results are retried a few times,
+  // then logged quietly — the next check (tick/test endpoint) re-probes once
+  // Core is warm and will flip availability + log "detected". The 42h log
+  // showed both the false "NOT detected" at boot AND a later "detected".
+  const detectMusicAssistant = async (opts?: { retries?: number; retryDelayMs?: number }) => {
     if (!supervised) {
       musicAssistantAvailable = false;
       return;
     }
-    musicAssistantAvailable = await hasService('music_assistant', 'play_announcement');
-    if (musicAssistantAvailable) {
+    const retries = opts?.retries ?? 5;
+    const retryDelayMs = opts?.retryDelayMs ?? 3000;
+    let result: 'present' | 'absent' | 'unknown' = 'unknown';
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      result = await probeService('music_assistant', 'play_announcement');
+      if (result !== 'unknown') break; // definitive answer
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+        if (stopped) return;
+      }
+    }
+    musicAssistantAvailable = result === 'present';
+    if (result === 'present') {
       log('broadcast: music_assistant.play_announcement detected');
-    } else {
+    } else if (result === 'absent') {
+      // Confirmed: catalog retrieved, MA's service genuinely not in it.
       log('broadcast: music_assistant.play_announcement NOT detected — broadcasts will fail until MA is installed');
+    } else {
+      // Never got a confirmed catalog (Core/Supervisor not ready). Stay calm;
+      // the periodic test/manual re-check resolves this once HA is up.
+      log('broadcast: music_assistant.play_announcement check inconclusive at startup (HA service registry not ready yet); will re-check on next broadcast/test');
     }
   };
 

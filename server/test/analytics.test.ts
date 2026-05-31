@@ -6,6 +6,8 @@ import {
   onPeakAt,
   forecastDayAlerts,
   resetHaStateShortLivedCaches,
+  resetForecastCachesForTesting,
+  computeBaselineAlerts,
   computeRoundTripEfficiency,
   computeSelfConsumption,
   computeEquipmentHealth,
@@ -302,4 +304,75 @@ test('computeEquipmentHealth — query count bounded; 5-min bucketing in use', (
   // standby calculations themselves; only the SHP2 panel_load fallback
   // uses it (and there's no SHP2 in this synthetic fleet).
   assert.equal(rec.queryCount, 0);
+});
+
+/* ===================================================================
+ * v0.9.80 — sustained-excursion gate on bursty SHP2 load circuits.
+ *
+ * Bimodal loads (AC compressors) + the May→summer ramp leave the
+ * hour-of-day baseline dominated by the off/low state, so a single
+ * compressor-on reading reads as a huge outlier and re-fired every
+ * cycle (42h log: "East Air conditioner load unusual for the hour" ×13).
+ * The gate requires the excursion to PERSIST across the recent real-time
+ * window before flagging: a stuck/faulted circuit holds; a normal cycle
+ * does not.
+ * =================================================================== */
+
+function shp2LoadDevice(circuitName: string, liveW: number): Record<string, DeviceSnapshot> {
+  return {
+    SHP: {
+      sn: 'SHP', deviceName: 'Smart Panel', productName: 'Smart Home Panel 2',
+      online: true, lastUpdated: Date.now(),
+      projection: {
+        kind: 'shp2',
+        pairedCircuits: [],
+        circuits: [{ ch: 4, name: circuitName, watts: liveW, breakerAmps: 20 }],
+      },
+    } as unknown as DeviceSnapshot,
+  };
+}
+
+// Build a recorder returning a fixed history for any (sn, metric). `recentW`
+// are the last-30-min samples (newest), `baseW` the older hour-of-day history
+// (placed on prior days so they fall in the ±1h bucket). Ascending by ts.
+function loadHistory(baseW: number, recentW: number[]): Recorder {
+  const now = Date.now();
+  const DAY = 86_400_000;
+  const pts: Array<{ ts: number; value: number }> = [];
+  // 20 days of low-baseline samples, one per day at ~now's hour-of-day.
+  for (let k = 20; k >= 1; k--) pts.push({ ts: now - k * DAY, value: baseW });
+  // recent real-time window: spread across the last ~28 min, oldest first.
+  const span = recentW.length;
+  recentW.forEach((v, i) => pts.push({ ts: now - (span - i) * 5 * 60_000 + 60_000, value: v }));
+  return {
+    insertSnapshot: () => {},
+    query: () => pts,
+    queryMulti: () => new Map(),
+    listMetrics: () => [],
+    close: () => {},
+    rollupLifetime: () => {},
+    getLifetimeTotals: () => ({}),
+  } as unknown as Recorder;
+}
+
+const loadAlerts = (devices: Record<string, DeviceSnapshot>, rec: Recorder) =>
+  computeBaselineAlerts(devices, rec).filter((a) => /unusual for the hour/.test(a.title));
+
+test('computeBaselineAlerts — bursty AC cycling does NOT flag (transient spike)', () => {
+  resetForecastCachesForTesting();
+  // Mostly-off baseline (150 W); a single compressor-on spike in the recent
+  // window and live=3200 W. Without the gate this fires (huge z); with it,
+  // only 1 of 6 recent samples is elevated → not sustained → suppressed.
+  const rec = loadHistory(150, [150, 150, 3200, 150, 150, 150]);
+  assert.equal(loadAlerts(shp2LoadDevice('East Air conditioner', 3200), rec).length, 0);
+});
+
+test('computeBaselineAlerts — genuinely stuck-on circuit DOES flag (sustained)', () => {
+  resetForecastCachesForTesting();
+  // Same low baseline, but the recent window is ALL elevated (circuit stuck
+  // on / fault) and live=3200 W → sustained → fires.
+  const rec = loadHistory(150, [3200, 3200, 3200, 3200, 3200, 3200]);
+  const alerts = loadAlerts(shp2LoadDevice('East Air conditioner', 3200), rec);
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].title, /unusual for the hour/);
 });

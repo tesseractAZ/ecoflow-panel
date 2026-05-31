@@ -3,6 +3,78 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.9.80 — 2026-05-31
+
+**Log-driven fixes from a 42-hour production log (5 issues investigated
+in parallel, 4 fixed).**
+
+Enhanced analysis of the add-on log surfaced five issues; four were real
+and are fixed here, one was confirmed environmental (no change).
+
+### A. MPPT error-code false alerts (alerts.ts)
+
+"HV MPPT error code" fired 9× and "LV MPPT error code" 8× over 42h while
+the live codes read 0 — the curtailment-shed signature. When the DPU
+sheds the LV string (battery full), the input sits at open-circuit
+voltage with ~0 A and EcoFlow reports a non-zero *standby* status that
+is not a fault, and the alert flagged any non-zero code. Now an MPPT
+error only fires when that string is actually **producing** (drawing
+current at a lit voltage), mirroring the UI's `channelState` thresholds
+(10 V / 0.1 A). A real fault while the string draws current still fires.
+
+### B. Cache-warmer 4-5.6 s slow cycles (analytics.ts)
+
+The warmer logged "slow cycle" 22× with runway + round-trip-efficiency +
+degradation all at a near-identical ~4100 ms — the tell of a shared
+bottleneck, not three slow functions. Root cause: `DEGRADE_REPORT_HISTORY_MS`
+was **400 days** while the recorder prunes to 30, so the SoH regression
+scanned ~370 days of empty index range per pack every cache cycle, and on
+synchronous SQLite that serialized the whole "parallel" cohort. Capped to
+30 days (= `RETAIN_MS`). Output is byte-for-byte identical (no rows beyond
+30 days exist to regress); the dominant scan disappears.
+
+### C. AC load-anomaly alert spam (analytics.ts)
+
+"East/West/Garage Air conditioner load unusual for the hour" fired 21+
+times. AC compressors are bimodal (on/off cycling) and the May→summer
+ramp leaves the hour-of-day baseline dominated by the off state, so a
+single compressor-on reading reads as a huge outlier and the rising-edge
+debounce re-queued every cycle. Added a **sustained-excursion gate** to
+SHP2 load circuits: the excursion must persist across a majority of the
+recent real-time window (last 30 min) before flagging. A stuck/faulted
+circuit clears it; normal cycling does not. Thermal/SoC targets unaffected.
+
+### D. MQTT/REST DNS resilience — no change (environmental)
+
+`getaddrinfo EAI_AGAIN` (16×) + 8 reconnects over 42h. Audited the mqtt
+reconnect + REST poller: errors are caught (no crash path), bounded, and
+the low volume (8 reconnects/42h) proves no tight loop. Confirmed
+transient Pi DNS flakiness; current handling is adequate. No code change.
+
+### E. Music Assistant startup-detection race (broadcast.ts, haService.ts)
+
+The log showed both "play_announcement NOT detected — broadcasts will
+fail" at boot AND "detected" later — MA is installed; the first check ran
+before HA's service registry was ready. `hasService` collapsed a failed
+catalog fetch into the same `false` as genuine absence. New three-state
+`probeService` (present / absent / **unknown**) + a retry-on-unknown loop
+at startup: the alarming line only fires on a *confirmed* absence; a
+transient/early failure logs a calm "inconclusive, will re-check" instead.
+
+### Tests
+
+8 new cases across `alertsMppt.test.ts` (new), `analytics.test.ts`,
+`broadcast.test.ts` (330 total, all pass): MPPT suppress-on-shed /
+fire-on-fault, sustained-gate cycling-vs-stuck, probeService unknown-not-
+absent.
+
+### Files touched
+
+`server/src/alerts.ts`, `server/src/analytics.ts`,
+`server/src/broadcast.ts`, `server/src/haService.ts`,
+`server/test/alertsMppt.test.ts` (new), `server/test/analytics.test.ts`,
+`server/test/broadcast.test.ts`, `CHANGELOG.md`, `config.yaml`.
+
 ## 0.9.79 — 2026-05-28
 
 **Solar-page MPPT channel states + taper-aware curtailment detection.**

@@ -157,3 +157,27 @@ test('generateAudioAssets — idempotent (does not re-write existing files)', as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/* ===================================================================
+ * v0.9.80 — probeService three-state probe. The startup race produced a
+ * false "music_assistant.play_announcement NOT detected — broadcasts
+ * will fail" line because hasService() collapsed a FAILED catalog fetch
+ * (Core not ready at boot) into the same `false` as "service genuinely
+ * absent". probeService distinguishes them: a failed fetch is 'unknown',
+ * never 'absent'. With no SUPERVISOR_TOKEN the catalog fetch returns null
+ * → must be 'unknown', proving a transient failure is never reported as a
+ * confirmed missing service.
+ * =================================================================== */
+import { probeService } from '../src/haService.js';
+
+test('probeService — failed catalog fetch yields "unknown", not "absent"', async () => {
+  const prev = process.env.SUPERVISOR_TOKEN;
+  delete process.env.SUPERVISOR_TOKEN;
+  try {
+    const r = await probeService('music_assistant', 'play_announcement');
+    assert.equal(r, 'unknown', 'a failed/early catalog fetch must be unknown, never a confirmed absent');
+  } finally {
+    if (prev === undefined) delete process.env.SUPERVISOR_TOKEN;
+    else process.env.SUPERVISOR_TOKEN = prev;
+  }
+});

@@ -166,6 +166,27 @@ export async function hasService(domain: string, service: string): Promise<boole
 }
 
 /**
+ * v0.9.80 — three-state service probe. Unlike `hasService` (which can't tell
+ * "catalog fetch failed" from "service genuinely absent"), this returns:
+ *   - 'present' : catalog fetched AND <domain>.<service> exists
+ *   - 'absent'  : catalog fetched successfully but lacked the service
+ *   - 'unknown' : catalog fetch failed — Core/Supervisor proxy not ready at
+ *                 boot, non-200, etc. The caller must NOT treat this as a
+ *                 confirmed negative (that startup race produced the spurious
+ *                 "broadcasts will fail until MA is installed" log line).
+ */
+export async function probeService(
+  domain: string,
+  service: string,
+): Promise<'present' | 'absent' | 'unknown'> {
+  const cat = await getServiceCatalog();
+  if (!cat) return 'unknown';
+  const d = cat.find((c) => c.domain === domain);
+  if (!d) return 'absent';
+  return service in d.services ? 'present' : 'absent';
+}
+
+/**
  * v0.9.19 — fetch all entity states. Used by the broadcast-discovery
  * endpoint to enumerate every media_player HA knows about, so the
  * user can pick targets from a real list instead of guessing entity IDs.

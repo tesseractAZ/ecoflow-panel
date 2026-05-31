@@ -34,6 +34,19 @@ export interface Alert {
 const cToF = (c: number) => c * 1.8 + 32;
 
 /*
+ * MPPT idle/shed guard (v0.9.80). During curtailment the DPU sheds the LV
+ * string (and throttles HV): the input shows open-circuit voltage but ~0 A /
+ * 0 W, and EcoFlow reports a non-zero *standby* status in hvPvErrCode /
+ * lvPvErrCode that is NOT a fault. Mirror web/src/pages/SolarPanel.tsx
+ * channelState(): a string is only "producing" (so a code is a real error)
+ * when it's drawing current at a lit voltage. Same 10 V / 0.1 A thresholds.
+ */
+const MPPT_VOLT_PRESENT = 10; // V — above this the string is connected/lit
+const MPPT_AMP_FLOOR = 0.1;   // A — at/below this we treat current as zero (idle)
+const mpptProducing = (volts: number | null, amps: number | null): boolean =>
+  amps != null && amps > MPPT_AMP_FLOOR && volts != null && volts > MPPT_VOLT_PRESENT;
+
+/*
  * Thresholds. EcoFlow's API does NOT expose cell-imbalance or temperature alarm
  * limits, so these are our own (general LFP best practice). Where EcoFlow exposes
  * an operating limit (emsParaVol window) we use its numbers directly.
@@ -234,11 +247,19 @@ export function computeAlerts(
     if ((p.sysErrCode ?? 0) !== 0) {
       out.push({ id: `dpu-err-${d.sn}`, severity: 'critical', category: 'Battery', device: d.deviceName, title: 'Inverter error code', detail: `${d.deviceName} reports system error code ${p.sysErrCode}.` });
     }
-    if ((p.pvHighErrCode ?? 0) !== 0) {
-      out.push({ id: `dpu-pvh-err-${d.sn}`, severity: 'warning', category: 'Solar', device: d.deviceName, title: 'HV MPPT error code', detail: `${d.deviceName} HV solar input reports error code ${p.pvHighErrCode}.` });
+    // v0.9.80 — only flag an MPPT error code when that string is actually
+    // PRODUCING. During curtailment the DPU sheds the LV string (and
+    // throttles HV): the input shows open-circuit voltage but ~0 A / 0 W,
+    // and EcoFlow reports a non-zero *standby* status in hvPvErrCode /
+    // lvPvErrCode that is NOT a fault. The 42h log queued "HV/LV MPPT error
+    // code" 17× while live codes read 0 — the classic shed signature.
+    // Mirror the UI's channelState thresholds (web SolarPanel.tsx): a code
+    // is only a real error if the string is drawing current.
+    if ((p.pvHighErrCode ?? 0) !== 0 && mpptProducing(p.pvHighVolts, p.pvHighAmps)) {
+      out.push({ id: `dpu-pvh-err-${d.sn}`, severity: 'warning', category: 'Solar', device: d.deviceName, title: 'HV MPPT error code', detail: `${d.deviceName} HV solar input reports error code ${p.pvHighErrCode} while producing (${p.pvHighVolts?.toFixed(0)} V, ${p.pvHighAmps?.toFixed(1)} A).` });
     }
-    if ((p.pvLowErrCode ?? 0) !== 0) {
-      out.push({ id: `dpu-pvl-err-${d.sn}`, severity: 'warning', category: 'Solar', device: d.deviceName, title: 'LV MPPT error code', detail: `${d.deviceName} LV solar input reports error code ${p.pvLowErrCode}.` });
+    if ((p.pvLowErrCode ?? 0) !== 0 && mpptProducing(p.pvLowVolts, p.pvLowAmps)) {
+      out.push({ id: `dpu-pvl-err-${d.sn}`, severity: 'warning', category: 'Solar', device: d.deviceName, title: 'LV MPPT error code', detail: `${d.deviceName} LV solar input reports error code ${p.pvLowErrCode} while producing (${p.pvLowVolts?.toFixed(0)} V, ${p.pvLowAmps?.toFixed(1)} A).` });
     }
 
     for (const [label, c] of [
