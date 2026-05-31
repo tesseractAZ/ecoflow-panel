@@ -27,6 +27,7 @@ import type { Alert } from './alerts.js';
 import type { FleetSnapshot, DeviceSnapshot } from './snapshot.js';
 import type { DpuProjection, Shp2Projection } from './ecoflow/project.js';
 import type { Recorder } from './recorder.js';
+import { getAnalytics, type AnalyticsClient } from './analyticsClient.js';
 // v0.9.59 — capture the REAL LR feature vector (same code path ml.ts /
 // computePackRiskV2 uses for inference) at alert fire time so the online
 // learner trains on the same inputs the model saw — not on a proxy
@@ -265,6 +266,12 @@ export async function captureLrFeatures(
   alert: Alert,
   snap: FleetSnapshot,
   recorder: Recorder,
+  // v0.10.0 — reports come from the analytics worker. Injectable so unit
+  // tests can supply an inline stub without spawning a worker; production
+  // (alertMonitor) omits it and the process-wide client is resolved lazily,
+  // AFTER the early `return null` guards, so the null-path tests never touch
+  // the (uninitialized-in-tests) singleton.
+  injectedAnalytics?: Pick<AnalyticsClient, 'report'>,
 ): Promise<Record<FeatureName, number> | null> {
   // Pack-level only. system/EVSE/SHP2 alerts have no LR feature signal.
   if (alert.packNum == null) return null;
@@ -275,11 +282,12 @@ export async function captureLrFeatures(
   if (!dev || dev.projection?.kind !== 'dpu') return null;
 
   try {
+    const analytics = injectedAnalytics ?? getAnalytics();
     const [degradation, thermalEvents, internalR, chargeCurve] = await Promise.all([
-      computeDegradation(snap.devices, recorder),
-      Promise.resolve(computeThermalEvents(snap.devices, recorder)),
-      Promise.resolve(computeInternalResistance(snap.devices, recorder)),
-      Promise.resolve(computeChargeCurveFingerprint(snap.devices, recorder)),
+      analytics.report('degradation'),
+      analytics.report('thermalEvents'),
+      analytics.report('internalResistance'),
+      analytics.report('chargeCurve'),
     ]);
     const fv = extractMlFeatures(
       dev.sn,

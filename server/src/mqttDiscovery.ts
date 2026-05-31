@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { SnapshotStore, FleetSnapshot } from './snapshot.js';
 import type { Recorder } from './recorder.js';
+import { getAnalytics } from './analyticsClient.js';
 import type { DpuProjection, Shp2Projection } from './ecoflow/project.js';
 import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
 import {
@@ -329,19 +330,21 @@ export async function startMqttDiscovery(
     let panelLoad = 0;
     if (shp2) for (const c of shp2.projection.circuits) panelLoad += c.watts ?? 0;
 
-    const fc = await getDayForecast(snap.devices, recorder, () => {});
-    const deg = await computeDegradation(snap.devices, recorder);
-    const runway = computeRunway(snap.devices, recorder, fc);
-    const rte = computeRoundTripEfficiency(snap.devices, recorder);
-    const clipping = await computeClipping(snap.devices, recorder, fc);
-    const sc = computeSelfConsumption(snap.devices, recorder);
+    const analytics = getAnalytics();
+    const [fc, deg, runway, rte, clipping, sc, carbon, tariff] = await Promise.all([
+      analytics.report('forecast'),
+      analytics.report('degradation'),
+      analytics.report('runway'),
+      analytics.report('roundTripEfficiency'),
+      analytics.report('clipping'),
+      analytics.report('selfConsumption'),
+      analytics.report('carbon'),
+      analytics.report('tariff'),
+    ]);
     const lifetime = recorder.getLifetimeTotals();
     const lifetimeKwh = (k: string) =>
       lifetime[k] ? Math.round(((lifetime[k].persistedWh + lifetime[k].pendingWh) / 1000) * 1000) / 1000 : null;
-    const carbon = computeCarbonReport(snap.devices, recorder);
-    const tariff = computeTariffReport(snap.devices, recorder);
-
-    const projecting = deg.packs.filter((p) => p.status === 'projecting');
+    const projecting = (deg as import('./analytics.js').FleetDegradation).packs.filter((p) => p.status === 'projecting');
     const soonest = projecting.reduce<typeof projecting[number] | null>(
       (best, p) => (best == null || (p.yearsToEol ?? 1e9) < (best.yearsToEol ?? 1e9) ? p : best),
       null,

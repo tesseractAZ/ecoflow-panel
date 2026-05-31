@@ -13,6 +13,7 @@ import { createServer } from 'node:net';
 import type { Socket } from 'node:net';
 import type { SnapshotStore } from '../snapshot.js';
 import type { Recorder } from '../recorder.js';
+import { getAnalytics } from '../analyticsClient.js';
 import { computeTotals, startOfLocalDayMs } from '../aggregator.js';
 import type { FleetEnergyTotals } from '../aggregator.js';
 import { getDayForecast, computeDegradation } from '../analytics.js';
@@ -223,10 +224,10 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
 
   const storeReady = () => Object.keys(store.get().devices).length > 0;
 
-  const refreshTotals = () => {
+  const refreshTotals = async () => {
     if (!storeReady()) return; // leave totals null until the fleet is discovered
     try {
-      totals = computeTotals(store, recorder, startOfLocalDayMs(), Date.now());
+      totals = await getAnalytics().report('totals', { sinceMs: startOfLocalDayMs(), untilMs: Date.now() });
     } catch (e: any) {
       log(`telnet: totals refresh failed: ${e?.message ?? e}`);
     }
@@ -239,7 +240,7 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
   const refreshForecast = async (): Promise<boolean> => {
     if (!storeReady()) return false;
     try {
-      const f = await getDayForecast(store.get().devices, recorder, () => {});
+      const f = await getAnalytics().report('forecast');
       if (f.historyDays > 0 || forecast == null) forecast = f;
       return f.historyDays > 0;
     } catch (e: any) {
@@ -262,7 +263,7 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
   const refreshDegradation = async (): Promise<boolean> => {
     if (!storeReady()) return false;
     try {
-      degradation = await computeDegradation(store.get().devices, recorder);
+      degradation = await getAnalytics().report('degradation');
       return true;
     } catch (e: any) {
       log(`telnet: degradation refresh failed: ${e?.message ?? e}`);
@@ -277,8 +278,8 @@ export function startTelnetServer(opts: TelnetServerOptions): { stop: () => void
     }, delayMs);
   };
 
-  refreshTotals();
-  const totalsTimer = setInterval(refreshTotals, 15_000);
+  void refreshTotals();
+  const totalsTimer = setInterval(() => { void refreshTotals(); }, 15_000);
   scheduleForecast(2_000);
   scheduleDegradation(3_000);
 

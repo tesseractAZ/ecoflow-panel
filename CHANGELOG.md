@@ -3,6 +3,60 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.10.0 — 2026-05-31
+
+**Analytics moved to a worker thread — the main event loop never blocks on SQLite again. Ends the watchdog restart loop.**
+
+Verifying v0.9.84 surfaced a *separate, pre-existing* problem: HA's Supervisor
+watchdog was restarting the add-on every ~40 min (11 restarts over a 7-hour
+window, almost all on v0.9.83 *before* the v0.9.84 deploy — mean interval 41
+min, range 7–106 min). Not a crash (clean SIGTERM, `mem 136 MB / 8 GB`), and
+not caused by v0.9.84. Root cause: `node:sqlite`'s `DatabaseSync` is
+**synchronous**, so every multi-second history scan (the cache-warmer's
+reports, the 20s alert-monitor eval, the per-tab `/api/*` endpoints) blocked
+the Node event loop. When the watchdog's port health-probe on :8787 happened
+to land during one of those blocks, it timed out → Supervisor restarted the
+container. Each restart cost a ~12s cold start and wiped in-memory state.
+
+**The definitive fix: move every heavy SQLite read off the main thread.**
+
+- **`analyticsWorker.ts`** — a dedicated worker thread opens its own
+  *read-only* connection to the same WAL database and runs every analytics
+  report + raw history query there. It holds the latest fleet snapshot
+  (pushed from the main thread, throttled) and self-warms its report caches.
+- **`analyticsClient.ts`** — main-thread proxy: spawns the worker, correlates
+  request/response, times out stuck calls, and respawns + re-pushes the
+  snapshot if the worker ever exits. A process singleton (`getAnalytics()`).
+- **`readRecorder.ts`** — the worker's read connection (query / queryMulti /
+  listMetrics), byte-for-byte parity with recorder.ts's read path.
+- **`reports.ts`** — the report registry: one builder per analytics report,
+  encapsulating its dependency chain (forecast → skill → dependents).
+- The main thread keeps the **sole write connection** (MQTT ingestion +
+  lifetime-energy rollup — both small, fast inserts that never block for
+  seconds). WAL mode lets the writer and the worker's reader run concurrently.
+
+**Rewired to the worker** (every recorder-backed consumer): all ~40 `/api/*`
+analytics endpoints, the alert monitor's 20s eval (forecast + baseline +
+forecast + curtailment alert signals), MQTT Discovery's periodic publish, the
+telnet console's 15s totals / 5-min forecast+degradation refreshers, and the
+ML feature-capture path. The old main-thread cache-warmer is **deleted** — the
+worker self-warms. Pure assemblers that take already-computed inputs and no
+recorder (confidence, repair-issues, pack-risk, dispatch-plan, calendar) stay
+on the main thread and compose worker-fetched reports there.
+
+**Benchmark (the proof):** 25 full-range scans (~181k rows each) on the main
+thread froze the event loop for **1066 ms**; the identical scans on the worker
+held main-loop lag to **34 ms** — **31.7× more responsive**. The work itself
+takes marginally longer (IPC + structured-clone overhead) but the main loop
+stays free the entire time, so the watchdog probe is always answered. tsx +
+`worker_threads` + `node:sqlite` verified working under the production runtime
+(`tsx src/index.ts`, no compile step).
+
+341 tests pass (7 new: readRecorder parity, bucketing, queryMulti, report
+registry); tsc clean. One deliberate exception: the telnet TRD trend screen
+still reads on-thread — it's render-on-demand for a connected telnet user
+(rare), not a background timer.
+
 ## 0.9.84 — 2026-05-31
 
 **Self-consumption solved head-on: per-calendar-day energy memoization.**

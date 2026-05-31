@@ -23,6 +23,7 @@ import { familyOf } from './alertOutcomes.js';
 // effectively never fire on a panel that gets occasional restarts.
 import { appendTelemetryEvent, readRecentTelemetry } from './alertTelemetry.js';
 import type { Recorder } from './recorder.js';
+import { getAnalytics } from './analyticsClient.js';
 
 /**
  * Watches the fleet, attaches computed alerts to the snapshot, and pushes a
@@ -485,7 +486,7 @@ export function startAlertMonitor(store: SnapshotStore, recorder: Recorder, log:
     let forecastDay: Alert[] = [];
     let stormPrep: Alert[] = [];
     try {
-      const df = await getDayForecast(snap.devices, recorder, log);
+      const df = await getAnalytics().report('forecast');
       forecastDay = forecastDayAlerts(df);
     } catch (e: any) {
       log(`forecast: day-ahead failed — ${e?.message ?? e}`);
@@ -500,7 +501,7 @@ export function startAlertMonitor(store: SnapshotStore, recorder: Recorder, log:
     // "you have X kW of headroom — could absorb with pool pump etc." copy.
     let curtailment: Alert[] = [];
     try {
-      curtailment = await computeCurtailmentAlerts(snap.devices, recorder);
+      curtailment = await getAnalytics().report('curtailmentAlerts');
     } catch (e: any) {
       log(`curtailment-alert: ${e?.message ?? e}`);
     }
@@ -520,11 +521,25 @@ export function startAlertMonitor(store: SnapshotStore, recorder: Recorder, log:
       perDevice,
     };
 
+    // v0.10.0 — baseline + forecast alert signals are recorder-backed; fetch
+    // them from the analytics worker so this 20s eval never scans SQLite on
+    // the main thread.
+    let baselineAlerts: Alert[] = [];
+    let forecastAlerts: Alert[] = [];
+    try {
+      [baselineAlerts, forecastAlerts] = await Promise.all([
+        getAnalytics().report('baselineAlerts'),
+        getAnalytics().report('forecastAlerts'),
+      ]);
+    } catch (e: any) {
+      log(`alert-signals: baseline/forecast failed — ${e?.message ?? e}`);
+    }
+
     const alerts = [
       ...computeAlerts(snap.devices, connectivity),
       ...computeLearnedAlerts(snap.devices),
-      ...computeBaselineAlerts(snap.devices, recorder),
-      ...computeForecastAlerts(snap.devices, recorder),
+      ...baselineAlerts,
+      ...forecastAlerts,
       ...forecastDay,
       ...stormPrep,
       ...curtailment,

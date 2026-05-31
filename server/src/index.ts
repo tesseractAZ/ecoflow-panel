@@ -14,7 +14,7 @@ import type { DeviceSnapshot } from './snapshot.js';
 import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
 import { startMqtt } from './ecoflow/mqtt.js';
 import { createRecorder } from './recorder.js';
-import { computeTotals, startOfLocalDayMs, circuitHistoryByDay } from './aggregator.js';
+import { startOfLocalDayMs } from './aggregator.js';
 import { startAlertMonitor } from './alertMonitor.js';
 import { isConfigured } from './notify.js';
 // v0.9.18 — ship-wide audible broadcast to HomePod/Sonos via HA media_player.
@@ -41,36 +41,15 @@ import { physicsPmax, physicsScore, PHOENIX_SITE } from './physics/clearSky.js';
 import { analyzePackLfp } from './physics/lfpOcv.js';
 import { fitHierarchical, findOutliers, type HBPackObs } from './models/hierarchicalBayes.js';
 import { recommendDispatch, type MpcInputs } from './dispatch/mpc.js';
-import { backtestPvForecast } from './backtest.js';
 import {
-  getDayForecast,
-  computeDegradation,
-  computeRunway,
-  computeRoundTripEfficiency,
-  computeClipping,
-  computeCurtailment,
-  computeSelfConsumption,
-  computeThermalEvents,
-  computeEquipmentHealth,
-  computeShadeReport,
-  computeSoilingDecomposition,
-  computeStringMismatch,
-  computeEvWindowPrediction,
-  computeChargeCurveFingerprint,
-  computeInternalResistance,
-  computeForecastSkill,
-  computeAmbientThermalForecast,
+  // v0.10.0 — recorder-backed compute* moved to the analytics worker
+  // (see analyticsClient.report). Only the PURE assemblers that take
+  // already-computed inputs and no recorder stay imported here; they run
+  // cheaply on the main thread over worker-fetched report data.
   computeConfidenceSnapshot,
   getActiveNwsAlerts,
-  // v0.8.0 additions
-  computeCarbonReport,
-  computeTariffReport,
-  computeProbabilisticForecast,
-  computeMultiDayForecast,
   computeDispatchPlan,
   rootCausesFor,
-  // v0.9.0 additions — Bayesian + Kalman + risk score
-  computeBayesianSolarModel,
   computePackRiskScores,
 } from './analytics.js';
 import type { DpuProjection, Shp2Projection } from './ecoflow/project.js';
@@ -80,7 +59,7 @@ import { buildCalendarIcs } from './calendar.js';
 import { computeRepairIssues } from './repairIssues.js';
 import { getWeather } from './weather.js';
 import { computePackRiskV2 } from './ml.js';
-import { startCacheWarmer } from './cacheWarmer.js';
+import { initAnalyticsClient } from './analyticsClient.js';
 import {
   refreshShp2CloudPresence,
   debugSendCommand,
@@ -312,6 +291,15 @@ if (existsSync(lovelaceDist)) {
 
 const store = new SnapshotStore();
 const recorder = createRecorder(store, (m) => app.log.info(m));
+// v0.10.0 — analytics worker. Every heavy history scan (the cache-warmer's
+// reports + each /api/* analytics endpoint) runs on the worker's event loop
+// against a read-only connection to the same WAL DB. The main thread keeps
+// the sole write connection (ingestion + lifetime rollup) and never blocks on
+// a multi-second SQLite scan again — which is what was intermittently
+// starving the HTTP port and tripping the Supervisor watchdog. The worker
+// self-warms its report caches, so the old main-thread cache-warmer is gone.
+const analytics = initAnalyticsClient(resolve(process.cwd(), config.dbPath), (m) => app.log.info(m));
+store.on('change', (snap) => analytics.pushSnapshot(snap));
 
 app.get('/api/snapshot', async () => store.get());
 app.get('/api/health', async () => ({ ok: true, generatedAt: store.get().generatedAt }));
@@ -356,7 +344,7 @@ app.get<{ Querystring: { sn?: string; metric?: string; since?: string; until?: s
     const sinceMs = since ? Number(since) : Date.now() - 60 * 60 * 1000;
     const untilMs = until ? Number(until) : Date.now();
     const bucketSec = bucket ? Number(bucket) : undefined;
-    const points = recorder.query(sn, metric, sinceMs, untilMs, bucketSec);
+    const points = await analytics.query(sn, metric, sinceMs, untilMs, bucketSec);
     // v0.9.14 — short Cache-Control + ETag so repeat fetches from the same
     // dashboard tab return 304. History rows are append-only; 15s of staleness
     // on the trailing edge is fine for chart UX.
@@ -367,7 +355,7 @@ app.get<{ Querystring: { sn?: string; metric?: string; since?: string; until?: s
 app.get<{ Querystring: { since?: string; until?: string } }>('/api/summary/today', async (req, reply) => {
   const since = req.query.since ? Number(req.query.since) : startOfLocalDayMs();
   const until = req.query.until ? Number(req.query.until) : Date.now();
-  return cached(req, reply, computeTotals(store, recorder, since, until), 30);
+  return cached(req, reply, await analytics.report('totals', { sinceMs: since, untilMs: until }), 30);
 });
 
 /**
@@ -396,7 +384,7 @@ app.get<{ Querystring: { sn?: string; ch?: string; pair?: string; days?: string 
     }
     const daysNum = Math.max(1, Math.min(30, Number(days ?? 7) || 7));
     const metric = pair ? `pair${chNum}_w` : undefined;
-    return circuitHistoryByDay(recorder, sn, chNum, daysNum, metric);
+    return await analytics.report('circuitHistory', { sn, ch: chNum, days: daysNum, metric });
   },
 );
 
@@ -434,7 +422,7 @@ app.get<{ Querystring: { sn?: string } }>('/api/metrics', async (req, reply) => 
     reply.code(400);
     return { error: 'sn required' };
   }
-  return { sn, metrics: recorder.listMetrics(sn) };
+  return { sn, metrics: await analytics.listMetrics(sn) };
 });
 
 // v0.9.14 — these endpoints all sit downstream of cache-warmer-hot computes,
@@ -442,27 +430,25 @@ app.get<{ Querystring: { sn?: string } }>('/api/metrics', async (req, reply) => 
 // short max-age) saves the JSON-serialization + network cost on repeat fetches
 // from the same browser tab.
 app.get('/api/forecast', async (req, reply) =>
-  cached(req, reply, await getDayForecast(store.get().devices, recorder, (m) => app.log.info(m)), 60),
+  cached(req, reply, await analytics.report('forecast'), 60),
 );
 
 app.get('/api/degradation', async (req, reply) =>
-  cached(req, reply, await computeDegradation(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('degradation'), 60),
 );
 
-app.get('/api/runway', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return cached(req, reply, computeRunway(store.get().devices, recorder, fc), 30);
-});
+app.get('/api/runway', async (req, reply) =>
+  cached(req, reply, await analytics.report('runway'), 30),
+);
 
 app.get<{ Querystring: { days?: string } }>('/api/round-trip-efficiency', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return cached(req, reply, computeRoundTripEfficiency(store.get().devices, recorder, days), 60);
+  return cached(req, reply, await analytics.report('roundTripEfficiency', { days }), 60);
 });
 
-app.get('/api/clipping', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return cached(req, reply, computeClipping(store.get().devices, recorder, fc), 60);
-});
+app.get('/api/clipping', async (req, reply) =>
+  cached(req, reply, await analytics.report('clipping'), 60),
+);
 
 // v0.9.77 — SoC-saturation curtailment (distinct from inverter clipping).
 // Surfaces "PV being rejected at the panels because batteries are full".
@@ -470,7 +456,7 @@ app.get('/api/clipping', async (req, reply) => {
 // standard hash-etag + 60s Cache-Control treatment used by every other
 // analytics endpoint, so dashboards re-poll without re-shipping bytes.
 app.get('/api/curtailment', async (req, reply) =>
-  cached(req, reply, computeCurtailment(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('curtailment'), 60),
 );
 
 // v0.7.6 — lifetime energy counters for HA Energy Dashboard.
@@ -497,56 +483,57 @@ app.get('/api/lifetime-energy', async (req, reply) => {
 // v0.7.5 — new analytics endpoints (all cached v0.9.14)
 app.get<{ Querystring: { days?: string } }>('/api/self-consumption', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return cached(req, reply, computeSelfConsumption(store.get().devices, recorder, days), 60);
+  return cached(req, reply, await analytics.report('selfConsumption', { days }), 60);
 });
 
 app.get('/api/thermal-events', async (req, reply) =>
-  cached(req, reply, computeThermalEvents(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('thermalEvents'), 60),
 );
 
 app.get('/api/equipment-health', async (req, reply) =>
-  cached(req, reply, computeEquipmentHealth(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('equipmentHealth'), 60),
 );
 
 app.get('/api/shade-report', async (req, reply) =>
-  cached(req, reply, computeShadeReport(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('shadeReport'), 60),
 );
 
 app.get('/api/soiling-decomposition', async (req, reply) =>
-  cached(req, reply, await computeSoilingDecomposition(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('soilingDecomposition'), 60),
 );
 
 app.get('/api/string-mismatch', async (req, reply) =>
-  cached(req, reply, computeStringMismatch(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('stringMismatch'), 60),
 );
 
 app.get('/api/ev-window-prediction', async (req, reply) =>
-  cached(req, reply, computeEvWindowPrediction(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('evWindowPrediction'), 60),
 );
 
 app.get('/api/charge-curve', async (req, reply) =>
-  cached(req, reply, computeChargeCurveFingerprint(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('chargeCurve'), 60),
 );
 
 app.get('/api/internal-resistance', async (req, reply) =>
-  cached(req, reply, computeInternalResistance(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('internalResistance'), 60),
 );
 
 app.get<{ Querystring: { days?: string } }>('/api/forecast-skill', async (req, reply) => {
   const days = Math.max(1, Math.min(14, Number(req.query.days ?? 7) || 7));
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return cached(req, reply, await computeForecastSkill(store.get().devices, recorder, fc, days), 60);
+  return cached(req, reply, await analytics.report('forecastSkill', { days }), 60);
 });
 
 app.get('/api/ambient-thermal-forecast', async (req, reply) =>
-  cached(req, reply, await computeAmbientThermalForecast(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('ambientThermal'), 60),
 );
 
 app.get('/api/confidence', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  const deg = await computeDegradation(store.get().devices, recorder);
-  const thermal = await computeAmbientThermalForecast(store.get().devices, recorder);
-  const skill = await computeForecastSkill(store.get().devices, recorder, fc);
+  const [fc, deg, thermal, skill] = await Promise.all([
+    analytics.report('forecast'),
+    analytics.report('degradation'),
+    analytics.report('ambientThermal'),
+    analytics.report('forecastSkill'),
+  ]);
   return cached(req, reply, computeConfidenceSnapshot(deg, fc, thermal, skill), 60);
 });
 
@@ -812,28 +799,25 @@ app.get<{ Querystring: { limit?: string } }>(
 // dispatch planner, calendar, repair issues (all cached v0.9.14)
 app.get<{ Querystring: { days?: string } }>('/api/carbon', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return cached(req, reply, computeCarbonReport(store.get().devices, recorder, days), 60);
+  return cached(req, reply, await analytics.report('carbon', { days }), 60);
 });
 
 app.get<{ Querystring: { days?: string } }>('/api/tariff', async (req, reply) => {
   const days = Math.max(1, Math.min(30, Number(req.query.days ?? 7) || 7));
-  return cached(req, reply, computeTariffReport(store.get().devices, recorder, days), 60);
+  return cached(req, reply, await analytics.report('tariff', { days }), 60);
 });
 
-app.get('/api/forecast/probabilistic', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  const skill = await computeForecastSkill(store.get().devices, recorder, fc);
-  return cached(req, reply, computeProbabilisticForecast(fc, skill), 60);
-});
+app.get('/api/forecast/probabilistic', async (req, reply) =>
+  cached(req, reply, await analytics.report('probabilisticForecast'), 60),
+);
 
 app.get<{ Querystring: { days?: string } }>('/api/forecast/multi-day', async (req, reply) => {
   const days = Math.max(1, Math.min(7, Number(req.query.days ?? 3) || 3));
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  return cached(req, reply, computeMultiDayForecast(store.get().devices, recorder, fc, days), 60);
+  return cached(req, reply, await analytics.report('multiDayForecast', { days }), 60);
 });
 
 app.get('/api/dispatch-plan', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
+  const fc = await analytics.report('forecast');
   return cached(req, reply, computeDispatchPlan(store.get().devices, fc), 60);
 });
 
@@ -844,8 +828,10 @@ app.get('/api/root-cause', async (req) => {
 });
 
 app.get('/api/calendar.ics', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  const ev = computeEvWindowPrediction(store.get().devices, recorder);
+  const [fc, ev] = await Promise.all([
+    analytics.report('forecast'),
+    analytics.report('evWindowPrediction'),
+  ]);
   const nws = await getActiveNwsAlerts();
   const ics = buildCalendarIcs({ devices: store.get().devices, forecast: fc, evWindow: ev, nwsAlerts: nws });
   reply
@@ -859,14 +845,16 @@ app.get('/api/calendar.ics', async (req, reply) => {
 
 // v0.9.0 — Bayesian solar model + Pack Risk Scores (cached v0.9.14)
 app.get('/api/forecast/bayesian', async (req, reply) =>
-  cached(req, reply, computeBayesianSolarModel(store.get().devices, recorder), 60),
+  cached(req, reply, await analytics.report('bayesianSolar'), 60),
 );
 
 app.get('/api/pack-risk', async (req, reply) => {
-  const deg = await computeDegradation(store.get().devices, recorder);
-  const therm = computeThermalEvents(store.get().devices, recorder);
-  const ir = computeInternalResistance(store.get().devices, recorder);
-  const cc = computeChargeCurveFingerprint(store.get().devices, recorder);
+  const [deg, therm, ir, cc] = await Promise.all([
+    analytics.report('degradation'),
+    analytics.report('thermalEvents'),
+    analytics.report('internalResistance'),
+    analytics.report('chargeCurve'),
+  ]);
   return cached(req, reply, computePackRiskScores(store.get().devices, deg, therm, ir, cc), 60);
 });
 
@@ -877,24 +865,30 @@ app.get('/api/pack-risk', async (req, reply) => {
 // (lr-heuristic-baseline-v1). When real failures accumulate, drop a CSV
 // into data/labels.csv and run `npm run train-pack-risk`.
 app.get('/api/pack-risk/v2', async (req, reply) => {
-  const deg = await computeDegradation(store.get().devices, recorder);
-  const therm = computeThermalEvents(store.get().devices, recorder);
-  const ir = computeInternalResistance(store.get().devices, recorder);
-  const cc = computeChargeCurveFingerprint(store.get().devices, recorder);
+  const [deg, therm, ir, cc] = await Promise.all([
+    analytics.report('degradation'),
+    analytics.report('thermalEvents'),
+    analytics.report('internalResistance'),
+    analytics.report('chargeCurve'),
+  ]);
   const heur = computePackRiskScores(store.get().devices, deg, therm, ir, cc);
   return cached(req, reply, computePackRiskV2(store.get().devices, heur.packs, deg, therm, ir, cc), 60);
 });
 
 app.get('/api/repair-issues', async (req, reply) => {
-  const fc = await getDayForecast(store.get().devices, recorder, () => {});
-  const skill = await computeForecastSkill(store.get().devices, recorder, fc);
+  const [forecastSkill, degradation, soiling, equipmentHealth] = await Promise.all([
+    analytics.report('forecastSkill'),
+    analytics.report('degradation'),
+    analytics.report('soilingDecomposition'),
+    analytics.report('equipmentHealth'),
+  ]);
   return cached(req, reply, computeRepairIssues({
     devices: store.get().devices,
     alerts: store.get().alerts ?? [],
-    degradation: await computeDegradation(store.get().devices, recorder),
-    soiling: await computeSoilingDecomposition(store.get().devices, recorder),
-    equipmentHealth: computeEquipmentHealth(store.get().devices, recorder),
-    forecastSkill: skill,
+    degradation,
+    soiling,
+    equipmentHealth,
+    forecastSkill,
   }), 60);
 });
 
@@ -934,22 +928,24 @@ app.get('/api/ha-state', async (req, reply) => {
   if (shp2) for (const c of shp2.projection.circuits) panelLoad += c.watts ?? 0;
 
   // Cached projections (internally cached ~30min — cheap to call per-request).
-  const fc = await getDayForecast(snap.devices, recorder, () => {});
-  const deg = await computeDegradation(snap.devices, recorder);
-  const runway = computeRunway(snap.devices, recorder, fc);
-  const rte = computeRoundTripEfficiency(snap.devices, recorder);
-  const clipping = await computeClipping(snap.devices, recorder, fc);
-  const curtailment = await computeCurtailment(snap.devices, recorder);
-  const selfCons = computeSelfConsumption(snap.devices, recorder);
+  const [fc, deg, runway, rte, clipping, curtailment, selfCons, carbon, tariff] = await Promise.all([
+    analytics.report('forecast'),
+    analytics.report('degradation'),
+    analytics.report('runway'),
+    analytics.report('roundTripEfficiency'),
+    analytics.report('clipping'),
+    analytics.report('curtailment'),
+    analytics.report('selfConsumption'),
+    analytics.report('carbon'),
+    analytics.report('tariff'),
+  ]);
   const lifetime = recorder.getLifetimeTotals();
   const lifetimeKwh = (k: string) =>
     lifetime[k] ? Math.round(((lifetime[k].persistedWh + lifetime[k].pendingWh) / 1000) * 1000) / 1000 : null;
-  // v0.8.0 additions
-  const carbon = computeCarbonReport(snap.devices, recorder);
-  const tariff = computeTariffReport(snap.devices, recorder);
+  // v0.8.0 additions — carbon + tariff fetched in the Promise.all above.
 
   // Soonest projected EOL = the pack with the fewest years left.
-  const projecting = deg.packs.filter((p) => p.status === 'projecting');
+  const projecting = (deg as import('./analytics.js').FleetDegradation).packs.filter((p) => p.status === 'projecting');
   type Pack = (typeof projecting)[number];
   const soonest = projecting.reduce<Pack | null>(
     (best, p) => (best == null || (p.yearsToEol ?? 1e9) < (best.yearsToEol ?? 1e9) ? p : best),
@@ -1292,7 +1288,7 @@ app.get('/api/dispatch/recommend', async (req, reply) => {
   const sp: any = shp2.projection;
   // Pull current forecast + load history for the next 24 h.
   let fc: any = null;
-  try { fc = await getDayForecast(store.get().devices, recorder, () => {}); } catch { /* */ }
+  try { fc = await analytics.report('forecast'); } catch { /* */ }
   // v0.9.59 — feed the MPC the actual per-hour PV+load curve from the
   // day-ahead forecast instead of flat-filling with the 24 h mean. Without
   // the diurnal signal the planner can't distinguish midday charging from
@@ -1310,8 +1306,7 @@ app.get('/api/dispatch/recommend', async (req, reply) => {
   let probHours: any[] = [];
   try {
     if (fc) {
-      const skill = await computeForecastSkill(store.get().devices, recorder, fc);
-      const prob = await computeProbabilisticForecast(fc, skill);
+      const prob = await analytics.report('probabilisticForecast');
       probHours = Array.isArray(prob?.hours) ? prob.hours : [];
     }
   } catch { /* probabilistic is optional — fall through */ }
@@ -1370,15 +1365,10 @@ app.get('/api/backtest/forecast', async (req, reply) => {
   // Higher-fidelity backtests can swap in the Bayesian or full forecast.
   let typicalWhPerHour = 0;
   try {
-    const fc = await getDayForecast(store.get().devices, recorder, () => {});
+    const fc: any = await analytics.report('forecast');
     typicalWhPerHour = (fc?.typicalPvWhPerDay ?? 0) / 24;
   } catch { /* */ }
-  const score = backtestPvForecast({
-    recorder,
-    dpuSns: dpus,
-    hoursBack: 168,
-    predict: () => typicalWhPerHour,
-  });
+  const score = await analytics.report('backtest', { dpuSns: dpus, hoursBack: 168, typicalWhPerHour });
   return cached(req, reply, { model: 'typical-day-baseline', ...score }, 600);
 });
 
@@ -1453,7 +1443,9 @@ try {
 // v0.9.5 — cache pre-warmer. Runs the heavy /api/ha-state computations
 // every 4 min so request-path callers always hit warm caches (was: every
 // 5 min the next /api/ha-state caller paid ~1.8s rebuilding everything).
-const cacheWarmer = startCacheWarmer(store, recorder, (m) => app.log.info(m));
+// v0.10.0 — the analytics worker self-warms its report caches in a worker
+// thread; the old main-thread cache-warmer (the dominant source of the
+// multi-second event-loop blocks that tripped the Supervisor watchdog) is gone.
 
 // v0.9.18 / v0.9.70 — Ship-wide audible broadcast. Listens for alert-
 // condition transitions (green/yellow/red) and pushes a combined
@@ -1467,9 +1459,10 @@ const broadcast = startBroadcastMonitor(store, (m) => app.log.info(m), {
   cacheUrlPath: '/audio-render',
 });
 
-// Diagnostics: per-task warm timings + alert-monitor stats.
+// Diagnostics: the analytics worker is the cache warmer now (self-warming
+// inside a worker thread). Endpoint kept for backward-compat.
 app.get('/api/cache-warmer/status', async () => ({
-  timings: cacheWarmer.lastTimings(),
+  mode: 'worker-self-warm',
 }));
 
 /* v0.9.18 — broadcast diagnostic + manual test endpoints.
@@ -1797,7 +1790,7 @@ const shutdown = async () => {
   monitor.stop();
   stopTelnet?.();
   stopMqttDiscovery?.();
-  cacheWarmer.stop();
+  analytics.stop();
   broadcast.stop();
   recorder.close();
   await app.close();

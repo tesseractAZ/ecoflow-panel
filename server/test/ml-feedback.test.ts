@@ -56,6 +56,27 @@ delete process.env.PACK_RISK_MIN_PRECISION;
 const ml = await import('../src/ml.js');
 const { snapshotToLrFeatures } = await import('../src/models/onlineLR.js');
 const { captureLrFeatures } = await import('../src/featureSnapshot.js');
+// v0.10.0 — captureLrFeatures now sources its reports from the analytics
+// worker. In tests we inject a stub that delegates straight to the real
+// compute* functions with the test recorder, exercising the same code path
+// without spawning a worker thread.
+const {
+  computeDegradation: _cd,
+  computeThermalEvents: _cte,
+  computeInternalResistance: _cir,
+  computeChargeCurveFingerprint: _ccf,
+} = await import('../src/analytics.js');
+const makeAnalyticsStub = (snap: any, recorder: any) => ({
+  report: async (name: string) => {
+    switch (name) {
+      case 'degradation': return await _cd(snap.devices, recorder);
+      case 'thermalEvents': return _cte(snap.devices, recorder);
+      case 'internalResistance': return _cir(snap.devices, recorder);
+      case 'chargeCurve': return _ccf(snap.devices, recorder);
+      default: return null;
+    }
+  },
+});
 const { appendTelemetryEvent, readRecentTelemetry, readAllTelemetry } =
   await import('../src/alertTelemetry.js');
 
@@ -552,7 +573,7 @@ test('captureLrFeatures — pack alert on a known DPU returns a 6-D normalized v
     id: 'pack-hot-DPU1-1', severity: 'warning', category: 'Thermal',
     device: 'DPU1', title: '', detail: '', packNum: 1,
   };
-  const out = await captureLrFeatures(alert, snap, recorder);
+  const out = await captureLrFeatures(alert, snap, recorder, makeAnalyticsStub(snap, recorder));
   assert.ok(out, 'pack alert on a known DPU should return a vector');
   // The vector must have the exact 6 FEATURE_NAMES keys, all finite numbers.
   for (const name of ml.FEATURE_NAMES) {
