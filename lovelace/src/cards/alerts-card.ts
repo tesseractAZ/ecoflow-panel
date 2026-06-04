@@ -3,7 +3,7 @@ import { customElement, state } from 'lit/decorators.js';
 import { EcoflowCardBase } from '../shared/base-card.js';
 import { themeCss } from '../shared/theme.css.js';
 import { glossary } from '../shared/glossary.js';
-import { alertCounts } from '../shared/alerts.js';
+import { priorityOf, priorityCounts, ALARM_PRIORITY_ORDER, ALARM_PRIORITY_META } from '../shared/alerts.js';
 import type { Alert, ClearedAlert } from '../shared/types.js';
 import { fmtMins, fmtRel } from '../shared/format.js';
 // Side-effect imports register the custom elements.
@@ -56,6 +56,12 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
     css`
       :host {
         display: block;
+        /* v0.11.0 — High (ISA P2) has no theme token of its own. Blend
+           warn↔bad toward orange, falling back to a literal deep-orange where
+           color-mix is unsupported. Critical reuses --ef-bad, Medium --ef-warn,
+           Low --ef-info. */
+        --ef-high: #fb8c00;
+        --ef-high: color-mix(in srgb, var(--ef-warn) 55%, var(--ef-bad));
       }
       ha-card {
         padding: 12px;
@@ -79,6 +85,36 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
         flex-wrap: wrap;
         gap: 6px;
       }
+      /* v0.11.0 — ISA priority count chips. ef-badge lacks a High (orange)
+         tone, so the 4-tier chips are rendered here keyed on data-prio. */
+      .count-chip {
+        display: inline-flex;
+        align-items: center;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 999px;
+        line-height: 1.5;
+        white-space: nowrap;
+        background: var(--ef-line);
+        color: var(--ef-ink);
+      }
+      .count-chip[data-prio='critical'] {
+        background: color-mix(in srgb, var(--ef-bad) 22%, transparent);
+        color: var(--ef-bad);
+      }
+      .count-chip[data-prio='high'] {
+        background: color-mix(in srgb, var(--ef-high) 22%, transparent);
+        color: var(--ef-high);
+      }
+      .count-chip[data-prio='medium'] {
+        background: color-mix(in srgb, var(--ef-warn) 22%, transparent);
+        color: var(--ef-warn);
+      }
+      .count-chip[data-prio='low'] {
+        background: color-mix(in srgb, var(--ef-info) 22%, transparent);
+        color: var(--ef-info);
+      }
       .alerts-list {
         display: flex;
         flex-direction: column;
@@ -93,15 +129,19 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
         border-radius: 8px;
         background: color-mix(in srgb, var(--ef-panel) 92%, transparent);
       }
-      .alert-row[data-sev='critical'] {
+      .alert-row[data-prio='critical'] {
         border-color: color-mix(in srgb, var(--ef-bad) 45%, var(--ef-line));
         background: color-mix(in srgb, var(--ef-bad) 6%, var(--ef-panel));
       }
-      .alert-row[data-sev='warning'] {
+      .alert-row[data-prio='high'] {
+        border-color: color-mix(in srgb, var(--ef-high) 45%, var(--ef-line));
+        background: color-mix(in srgb, var(--ef-high) 6%, var(--ef-panel));
+      }
+      .alert-row[data-prio='medium'] {
         border-color: color-mix(in srgb, var(--ef-warn) 45%, var(--ef-line));
         background: color-mix(in srgb, var(--ef-warn) 5%, var(--ef-panel));
       }
-      .alert-row[data-sev='info'] {
+      .alert-row[data-prio='low'] {
         border-color: var(--ef-line);
       }
       .sev-dot {
@@ -112,13 +152,16 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
         align-self: flex-start;
         background: var(--ef-muted);
       }
-      .sev-dot[data-sev='critical'] {
+      .sev-dot[data-prio='critical'] {
         background: var(--ef-bad);
       }
-      .sev-dot[data-sev='warning'] {
+      .sev-dot[data-prio='high'] {
+        background: var(--ef-high);
+      }
+      .sev-dot[data-prio='medium'] {
         background: var(--ef-warn);
       }
-      .sev-dot[data-sev='info'] {
+      .sev-dot[data-prio='low'] {
         background: var(--ef-info);
       }
       .alert-body {
@@ -390,13 +433,13 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
   /* ── Rendering ───────────────────────────────────────────────────── */
 
   private renderAlertRow(a: Alert) {
-    const sev = a.severity;
+    const prio = priorityOf(a);
     const submitted = this.submittedOutcomes.get(a.id);
     const busy = this.busyOutcomes.get(a.id);
     const error = this.outcomeErrors.get(a.id);
     return html`
-      <div class="alert-row" data-sev=${sev}>
-        <span class="sev-dot" data-sev=${sev} aria-hidden="true"></span>
+      <div class="alert-row" data-prio=${prio}>
+        <span class="sev-dot" data-prio=${prio} aria-hidden="true"></span>
         <div class="alert-body">
           <div class="alert-title-row">
             <span class="alert-title">${a.title}</span>
@@ -456,7 +499,7 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
 
   private renderActiveSection() {
     const alerts = this.thresholdAlerts();
-    const counts = alertCounts(this.activeAlerts());
+    const counts = priorityCounts(this.activeAlerts());
     const title = `Active (${alerts.length})`;
     if (alerts.length === 0) {
       return html`
@@ -469,19 +512,17 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
         </ef-section>
       `;
     }
-    // Severity-tinted summary chips
+    // Priority-tinted summary chips, ordered Critical → Low (ISA-18.2).
     return html`
       <ef-section .title=${title}>
         <div slot="header" class="count-row">
-          ${counts.critical > 0
-            ? html`<ef-badge tone="bad">${glossary('critical')} ${counts.critical}</ef-badge>`
-            : nothing}
-          ${counts.warning > 0
-            ? html`<ef-badge tone="warn">${glossary('warning')} ${counts.warning}</ef-badge>`
-            : nothing}
-          ${counts.info > 0
-            ? html`<ef-badge tone="info">${glossary('info')} ${counts.info}</ef-badge>`
-            : nothing}
+          ${ALARM_PRIORITY_ORDER.map((p) =>
+            counts[p] > 0
+              ? html`<span class="count-chip" data-prio=${p}
+                  >${ALARM_PRIORITY_META[p].label} ${counts[p]}</span
+                >`
+              : nothing,
+          )}
         </div>
         <div class="alerts-list">
           ${alerts.map((a) => this.renderAlertRow(a))}
@@ -521,9 +562,10 @@ export class EcoflowAlertsCard extends EcoflowCardBase {
 
   private renderClearedRow(ce: ClearedAlert) {
     const a = ce.alert;
+    const prio = priorityOf(a);
     return html`
-      <div class="alert-row" data-sev=${a.severity}>
-        <span class="sev-dot" data-sev=${a.severity} aria-hidden="true"></span>
+      <div class="alert-row" data-prio=${prio}>
+        <span class="sev-dot" data-prio=${prio} aria-hidden="true"></span>
         <div class="alert-body">
           <div class="alert-title-row">
             <span class="alert-title">${a.title}</span>

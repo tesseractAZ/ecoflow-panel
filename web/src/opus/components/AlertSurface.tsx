@@ -11,6 +11,8 @@
 
 import type { Alert } from '../../alerts';
 import type { FleetSnapshot } from '../../types';
+// v0.11.0 — alert rows coloured by ISA priority (Critical/High/Medium/Low).
+import { priorityOf, type AlarmPriority } from '../../alertPriority';
 
 interface AlertSurfaceProps {
   snapshot: FleetSnapshot | null;
@@ -59,8 +61,9 @@ export function AlertSurface({ snapshot }: AlertSurfaceProps) {
 }
 
 function AlertRow({ alert }: { alert: Alert }) {
-  const color = colorFor(alert.severity);
-  const bg = bgFor(alert.severity);
+  const priority = priorityOf(alert);
+  const color = colorFor(priority);
+  const bg = bgFor(priority);
 
   return (
     <div
@@ -69,7 +72,7 @@ function AlertRow({ alert }: { alert: Alert }) {
         padding: '12px 14px',
         borderRadius: 10,
         background: bg,
-        border: `1px solid ${color}33`,
+        border: `1px solid ${colorAlpha(priority, 0.2)}`,
       }}
     >
       <span
@@ -135,17 +138,21 @@ function AllClearGraphic() {
   );
 }
 
-function colorFor(sev: Alert['severity']): string {
-  switch (sev) {
-    case 'critical': return 'var(--color-bad)';
-    case 'warning':  return 'var(--opus-solar)';
-    default:         return 'var(--opus-cosmic)';
-  }
+/** The theme CSS variable carrying each ISA priority's colour token. */
+const PRIORITY_TOKEN: Record<AlarmPriority, string> = {
+  critical: '--color-bad',
+  high: '--color-high',
+  medium: '--color-warn',
+  low: '--color-info',
+};
+
+function colorFor(p: AlarmPriority): string {
+  return `rgb(var(${PRIORITY_TOKEN[p]}))`;
 }
-function bgFor(sev: Alert['severity']): string {
-  switch (sev) {
-    case 'critical': return 'rgba(248, 113, 113, 0.05)';
-    case 'warning':  return 'rgba(251, 191, 36, 0.05)';
-    default:         return 'rgba(6, 182, 212, 0.04)';
-  }
+/** Same colour at a given alpha — theme-aware via the modern slash syntax. */
+function colorAlpha(p: AlarmPriority, alpha: number): string {
+  return `rgb(var(${PRIORITY_TOKEN[p]}) / ${alpha})`;
+}
+function bgFor(p: AlarmPriority): string {
+  return colorAlpha(p, 0.05);
 }

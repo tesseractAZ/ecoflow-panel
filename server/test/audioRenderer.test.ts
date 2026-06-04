@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { createServer, type Server, type Socket } from 'node:net';
 import { Buffer } from 'node:buffer';
 import { renderAnnouncement, renderCacheKey, parseWavHeader, pruneRenderCache, cachedRenderPath } from '../src/audioRenderer.js';
+import { getChimeRepeat } from '../src/alertSettings.js'; // v0.11.0 — klaxon repeats getChimeRepeat()× before TTS
 import { pcmToWav } from '../src/wyomingTts.js';
 
 /**
@@ -120,8 +121,10 @@ test('renderAnnouncement — klaxon-only (null message) caches the klaxon as-is,
     assert.equal(r.fromCache, false);
     // File exists in cache
     assert.ok(existsSync(resolve(cacheDir, r.filename!)));
-    // Has the klaxon's exact byte count (44-byte header + 1000 PCM)
-    assert.equal(r.sizeBytes, 1044);
+    // v0.11.0 — the chime repeats getChimeRepeat()× even on the klaxon-only path
+    // (44-byte header + N × 1000 PCM).
+    const N = getChimeRepeat();
+    assert.equal(r.sizeBytes, 44 + N * 1000);
   } finally {
     rmSync(klaxonDir, { recursive: true, force: true });
     rmSync(cacheDir, { recursive: true, force: true });
@@ -148,14 +151,16 @@ test('renderAnnouncement — klaxon + TTS combined into one WAV (PCM lengths sum
     assert.equal(r.ok, true, `render failed: ${r.error}`);
     assert.ok(r.filename);
     assert.equal(r.fromCache, false);
-    // Combined PCM = 500 (klaxon) + 800 (TTS) = 1300 bytes; +44 header = 1344
-    assert.equal(r.sizeBytes, 1344);
+    // v0.11.0 — Combined PCM = N × 500 (klaxon, repeated) + 800 (TTS); +44 header.
+    const N = getChimeRepeat();
+    const pcmLen = N * 500 + 800;
+    assert.equal(r.sizeBytes, 44 + pcmLen);
     // Verify the cached file parses as a valid WAV with the right data length
     const wav = readFileSync(resolve(cacheDir, r.filename!));
     const h = parseWavHeader(wav);
     assert.equal(h.ok, true);
     assert.equal(h.rate, 22050);
-    assert.equal(h.dataLength, 1300);
+    assert.equal(h.dataLength, pcmLen);
   } finally {
     mock.server.close();
     rmSync(klaxonDir, { recursive: true, force: true });

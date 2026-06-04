@@ -33,6 +33,7 @@
 
 import { getServiceCatalog, hasService, callHaService, getAllStates, ttsGetUrl, type ServiceCallResult } from './haService.js';
 import type { Alert } from './alerts.js';
+import { priorityOf, priorityAnnouncementPrefix } from './alertPriority.js';
 
 /* ─── service detection ──────────────────────────────────────────── */
 
@@ -390,12 +391,13 @@ export async function pickBestEngine(
 /**
  * Turn an Alert into a clear, spoken sentence. Examples:
  *
- *   "Red alert. Battery system, Core three pack two. Pack health critical.
- *    Pack S O H is sixty-eight point two percent, below seventy percent floor.
- *    Acknowledge at console alpha. Repeat. Red alert. Pack health critical."
+ *   "Critical alarm. Critical alarm. Battery system, Core three pack two.
+ *    Pack health critical. Pack S O H is sixty-eight point two percent, below
+ *    seventy percent floor. Acknowledge at console. Repeat. Critical alarm.
+ *    Critical alarm. Pack health critical."
  *
- *   "Yellow alert. Solar system, Core five. High voltage M P P T error code
- *    seventeen reported."
+ *   "High priority alarm. Solar system, Core five. High voltage M P P T error
+ *    code seventeen reported."
  *
  *   "All clear. All stations report normal."
  *
@@ -409,12 +411,21 @@ export function buildAlertMessage(level: 'red' | 'yellow' | 'green', alerts: Ale
   const isCritical = level === 'red';
   const primary = pickPrimaryAlert(alerts, level);
   if (!primary) {
+    // v0.11.0 — no primary alert in hand; derive the spoken prefix from the
+    // severity that this broadcast level represents (red→critical, yellow→
+    // warning) so the fallback uses ISA priority vocabulary too.
+    const fallbackPrefix = priorityAnnouncementPrefix(
+      priorityOf({ severity: isCritical ? 'critical' : 'warning' }),
+    );
     return isCritical
-      ? 'Red alert. Critical condition detected. Check console for details.'
-      : 'Yellow alert. Caution advised. Check console for details.';
+      ? `${fallbackPrefix} Critical condition detected. Check console for details.`
+      : `${fallbackPrefix} Caution advised. Check console for details.`;
   }
 
-  const prefix = isCritical ? 'Red alert. Red alert.' : 'Yellow alert.';
+  // v0.11.0 — ISA priority prefix derived from the primary alert (replaces the
+  // old colour-named "Red alert / Yellow alert"). Critical yields a repeated
+  // "Critical alarm. Critical alarm." from the helper.
+  const prefix = priorityAnnouncementPrefix(priorityOf(primary));
   const cat = ttsifyCategory(primary.category);
   const loc = ttsifyLocation(primary.coreNum, primary.packNum);
   const title = ttsifyText(primary.title);

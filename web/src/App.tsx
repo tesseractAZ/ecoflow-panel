@@ -33,6 +33,10 @@ const SolarPanel = lazy(() => import('./pages/SolarPanel').then((m) => ({ defaul
 const EvsePanel = lazy(() => import('./pages/EvsePanel').then((m) => ({ default: m.EvsePanel })));
 const StrategyPanel = lazy(() => import('./pages/StrategyPanel').then((m) => ({ default: m.StrategyPanel })));
 const AlertsPanel = lazy(() => import('./pages/AlertsPanel').then((m) => ({ default: m.AlertsPanel })));
+// v0.11.0 — Alert Settings: per-priority annunciation on/off + chime + preview.
+const AlertSettingsPanel = lazy(() =>
+  import('./pages/AlertSettingsPanel').then((m) => ({ default: m.AlertSettingsPanel })),
+);
 const PredictiveInsights = lazy(() => import('./pages/PredictiveInsights').then((m) => ({ default: m.PredictiveInsights })));
 const TrendChart = lazy(() => import('./charts/TrendChart').then((m) => ({ default: m.TrendChart })));
 
@@ -79,9 +83,9 @@ function NormalApp() {
   const { snapshot, conn } = useSnapshot();
   const devices = snapshot ? Object.values(snapshot.devices) : [];
   const [showHistory, setShowHistory] = useState(false);
-  const [tab, setTab] = useState<'dashboard' | 'solar' | 'thermal' | 'evse' | 'strategy' | 'alerts' | 'predictive'>(
-    'dashboard',
-  );
+  const [tab, setTab] = useState<
+    'dashboard' | 'solar' | 'thermal' | 'evse' | 'strategy' | 'alerts' | 'alert-settings' | 'predictive'
+  >('dashboard');
   const sorted = sortDevices(devices);
 
   // Attach glossary hover tooltips to every matching label across the app.
@@ -177,6 +181,13 @@ function NormalApp() {
               )}
             </button>
             <button
+              onClick={() => setTab('alert-settings')}
+              className={`px-3 py-1 transition-colors ${tab === 'alert-settings' ? 'bg-accent/20 text-accent' : 'text-muted hover:text-ink'}`}
+              title="Turn alarm annunciation on/off per ISA priority, set the chime repeat, and preview announcements."
+            >
+              Alert Settings
+            </button>
+            <button
               onClick={() => setTab('predictive')}
               className={`px-3 py-1 transition-colors flex items-center gap-1.5 ${tab === 'predictive' ? 'bg-accent/20 text-accent' : 'text-muted hover:text-ink'}`}
             >
@@ -220,6 +231,7 @@ function NormalApp() {
           {tab === 'evse' && <EvsePanel devices={snapshot.devices} />}
           {tab === 'strategy' && <StrategyPanel devices={snapshot.devices} />}
           {tab === 'alerts' && <AlertsPanel alerts={thresholdAlerts} />}
+          {tab === 'alert-settings' && <AlertSettingsPanel />}
           {tab === 'predictive' && <PredictiveInsights alerts={learnedAlerts} />}
         </Suspense>
       ) : (

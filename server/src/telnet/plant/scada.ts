@@ -31,6 +31,15 @@
  */
 
 import { c, padEnd, padStart, truncate, visLen, BOX } from '../ansi.js';
+// v0.11.0 — the alarm banner is keyed on the 4-tier ISA-18.2 / IEC 62682
+// priority (Critical/High/Medium/Low) instead of the raw severity.
+import { type AlarmPriority } from '../../alertPriority.js';
+
+/** ANSI colourizer for an ISA priority. No orange in the 16-colour palette, so
+ *  High shares Critical's bright-red; Medium = bright-yellow; Low = cyan. */
+function prioColor(p: AlarmPriority): (s: string) => string {
+  return p === 'critical' ? c.redB : p === 'high' ? c.redB : p === 'medium' ? c.yellowB : c.cyan;
+}
 
 /* ─── color discipline ────────────────────────────────────────────────── */
 
@@ -298,35 +307,38 @@ export function rule(width: number): string {
 /* ─── alarm banner — top-of-screen alarm summary ─────────────────────── */
 
 export interface AlarmBannerInput {
-  newest: { ts: number; text: string; severity: 'critical' | 'warning' | 'info' } | null;
-  counts: { critical: number; warning: number; info: number };
+  newest: { ts: number; text: string; priority: AlarmPriority } | null;
+  counts: Record<AlarmPriority, number>;
   ackCount: number;
+}
+
+/** Three-letter banner tag per priority — the "ALM/WRN/INF" of the 4-tier scheme. */
+function bannerTag(p: AlarmPriority): string {
+  return p === 'critical' ? 'ALM' : p === 'high' ? 'HI ' : p === 'medium' ? 'MED' : 'LOW';
 }
 
 /**
  * Render the alarm-banner strip — fits one line. Newest unack'd alarm
  * dominates the message area; counts shown right-justified.
  *
- *   ▌▌ALM 14:32:17  GEN.3.PACK.4.T HIGH  157°F           CRIT:1 WARN:3 ACK:0 ▌▌
+ *   ▌▌ALM 14:32:17  GEN.3.PACK.4.T HIGH  157°F      CRIT:1 HIGH:2 MED:3 ACK:0 ▌▌
  */
 export function alarmBanner(input: AlarmBannerInput, width: number): string {
   const { newest, counts, ackCount } = input;
   let leftCol: string;
   if (newest) {
-    const sevColor =
-      newest.severity === 'critical' ? c.redB :
-      newest.severity === 'warning' ? c.yellowB : c.cyan;
     const ts = new Date(newest.ts);
     const tstr = `${String(ts.getHours()).padStart(2, '0')}:${String(ts.getMinutes()).padStart(2, '0')}:${String(ts.getSeconds()).padStart(2, '0')}`;
-    const tag = sevColor(newest.severity === 'critical' ? 'ALM' : newest.severity === 'warning' ? 'WRN' : 'INF');
+    const tag = prioColor(newest.priority)(bannerTag(newest.priority));
     leftCol = `${c.redB('▌▌')} ${tag} ${c.grey(tstr)}  ${c.white(newest.text)}`;
   } else {
     leftCol = `${c.green('▌▌')} ${c.greenB('NORMAL')} ${c.grey('—  no active alarms')}`;
   }
   const rightSegs: string[] = [];
-  if (counts.critical > 0) rightSegs.push(c.redB(`CRIT:${counts.critical}`));
-  if (counts.warning > 0)  rightSegs.push(c.yellowB(`WARN:${counts.warning}`));
-  if (counts.info > 0)     rightSegs.push(c.cyan(`INFO:${counts.info}`));
+  if (counts.critical > 0) rightSegs.push(prioColor('critical')(`CRIT:${counts.critical}`));
+  if (counts.high > 0)     rightSegs.push(prioColor('high')(`HIGH:${counts.high}`));
+  if (counts.medium > 0)   rightSegs.push(prioColor('medium')(`MED:${counts.medium}`));
+  if (counts.low > 0)      rightSegs.push(prioColor('low')(`LOW:${counts.low}`));
   rightSegs.push(c.grey(`ACK:${ackCount}`));
   const rightCol = rightSegs.join(' ');
 

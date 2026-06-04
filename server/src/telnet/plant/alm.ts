@@ -1,13 +1,21 @@
 /**
  * ALM screen — alarm console.
  *
- * Sorted newest first. Each alarm shows its timestamp, severity tag,
+ * Sorted newest first. Each alarm shows its timestamp, ISA priority tag,
  * category, identifier, and message. Scrollable with ↑/↓.
  */
 
 import { c, padEnd, truncate, BOX } from '../ansi.js';
 import { divider } from './scada.js';
 import type { PlantData, PlantView } from './types.js';
+// v0.11.0 — derive the 4-tier ISA-18.2 / IEC 62682 alarm priority for display.
+import { priorityOf, priorityMeta, type AlarmPriority } from '../../alertPriority.js';
+
+/** ANSI colourizer for an ISA priority. No orange in the 16-colour palette, so
+ *  High shares Critical's bright-red; Medium = bright-yellow; Low = cyan. */
+function prioColor(p: AlarmPriority): (s: string) => string {
+  return p === 'critical' ? c.redB : p === 'high' ? c.redB : p === 'medium' ? c.yellowB : c.cyan;
+}
 
 export function renderAlm(view: PlantView, data: PlantData): string[] {
   const W = view.width;
@@ -18,14 +26,16 @@ export function renderAlm(view: PlantView, data: PlantData): string[] {
   // "this alarm was present at this moment" stamp.
   const stamp = data.snap.generatedAt ?? Date.now();
   const alerts = (data.snap.alerts ?? []).slice();
-  const crit = alerts.filter((a) => a.severity === 'critical').length;
-  const warn = alerts.filter((a) => a.severity === 'warning').length;
-  const info = alerts.filter((a) => a.severity === 'info').length;
+  // v0.11.0 — tally by the 4-tier ISA priority instead of raw severity.
+  const pc: Record<AlarmPriority, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const a of alerts) pc[priorityOf(a)]++;
 
   out.push(divider(`ALARM LIST — ${alerts.length} active`, W));
   out.push(padEnd(
-    '  ' + c.redB(`CRIT ${crit}`) + c.grey('  ·  ') + c.yellowB(`WARN ${warn}`) +
-    c.grey('  ·  ') + c.cyan(`INFO ${info}`) + c.grey('  ·  ') +
+    '  ' + prioColor('critical')(`CRIT ${pc.critical}`) + c.grey('  ·  ') +
+    prioColor('high')(`HIGH ${pc.high}`) + c.grey('  ·  ') +
+    prioColor('medium')(`MED ${pc.medium}`) + c.grey('  ·  ') +
+    prioColor('low')(`LOW ${pc.low}`) + c.grey('  ·  ') +
     c.grey('↑/↓ to scroll, ENTER to ack (not yet wired)'),
     W,
   ));
@@ -37,9 +47,9 @@ export function renderAlm(view: PlantView, data: PlantData): string[] {
   }
 
   // Column layout:
-  //   TS         SEV    CATEGORY     ID                       MESSAGE
+  //   TS         PRIO   CATEGORY     ID                       MESSAGE
   //   14:32:17   CRIT   THERMAL      pack-hot-Y711...         Pack 3 over 122°F
-  const headers = ['TIMESTAMP', 'SEV', 'CATEGORY', 'IDENTIFIER', 'MESSAGE'];
+  const headers = ['TIMESTAMP', 'PRIO', 'CATEGORY', 'IDENTIFIER', 'MESSAGE'];
   out.push('  ' + c.grey([
     padEnd(headers[0], 19),
     padEnd(headers[1], 6),
@@ -56,14 +66,13 @@ export function renderAlm(view: PlantView, data: PlantData): string[] {
   const p2 = (n: number) => String(n).padStart(2, '0');
   const tstr = `${tsDate.getFullYear()}-${p2(tsDate.getMonth() + 1)}-${p2(tsDate.getDate())} ${p2(tsDate.getHours())}:${p2(tsDate.getMinutes())}:${p2(tsDate.getSeconds())}`;
   for (const a of visible) {
-    const sevCol = a.severity === 'critical' ? c.redB :
-                   a.severity === 'warning' ? c.yellowB : c.cyan;
-    const sevTag = a.severity === 'critical' ? 'CRIT' : a.severity === 'warning' ? 'WARN' : 'INFO';
+    const prio = priorityOf(a);
+    const prioTag = priorityMeta(prio).tag;
     // Compose the message line: title + optional detail.
     const msg = a.detail ? `${a.title} — ${a.detail}` : a.title;
     out.push('  ' + [
       padEnd(c.grey(tstr), 19),
-      padEnd(sevCol(sevTag), 6),
+      padEnd(prioColor(prio)(prioTag), 6),
       padEnd(c.white((a.category ?? '—').toUpperCase()), 12),
       padEnd(c.white(truncate(a.id ?? '—', 22)), 22),
       c.whiteB(truncate(msg ?? '', Math.max(20, W - 64))),

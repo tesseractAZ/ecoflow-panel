@@ -71,6 +71,19 @@ import { callHaService, isSupervised, probeService } from './haService.js';
 import { parseQuietHours, inQuietWindow } from './alertMonitor.js';
 import { renderAnnouncement, pruneRenderCache } from './audioRenderer.js';
 import { buildAlertMessage } from './ttsService.js';
+// v0.11.0 — ISA-18.2 / IEC 62682 annunciation gate + per-priority preview.
+// A priority turned off on the Alert Settings page must never trigger the
+// chime/broadcast, so we filter silenced-priority alerts out before deriving
+// the broadcast condition. previewMessageFor() drives the per-priority
+// "preview announcement" feature on the settings page.
+import {
+  type AlarmPriority,
+  priorityOf,
+  klaxonLevelForPriority,
+  previewMessageFor,
+  priorityAnnouncementPrefix,
+} from './alertPriority.js';
+import { isPriorityEnabled } from './alertSettings.js';
 
 /* ─── config ──────────────────────────────────────────────────────── */
 
@@ -134,6 +147,23 @@ export function conditionFromAlerts(alerts: Alert[]): { level: ConditionLevel; c
 
 export interface BroadcastMonitor {
   test: (level?: ConditionLevel) => Promise<{ ok: boolean; messages: string[]; cooldownRemainingMs?: number }>;
+  /**
+   * v0.11.0 — render (and optionally play) a per-priority preview announcement
+   * for the Alert Settings page. `target: 'browser'` renders only and returns
+   * the WAV path for the browser to play via apiUrl(audioPath); `target:
+   * 'speakers'` ALSO plays it to the configured Music Assistant targets.
+   */
+  preview: (
+    priority: AlarmPriority,
+    target: 'browser' | 'speakers',
+  ) => Promise<{
+    ok: boolean;
+    spokenText: string;
+    audioPath?: string;
+    played: 'browser' | 'speakers';
+    error?: string;
+    cooldownRemainingMs?: number;
+  }>;
   config: () => BroadcastConfig;
   status: () => BroadcastStatus;
   stop: () => void;
@@ -165,6 +195,10 @@ export interface BroadcastStatus {
 }
 
 const TEST_COOLDOWN_MS = 10_000;
+/** v0.11.0 — separate, short cooldown for per-priority previews. Previews are
+ *  cheap (cache-aware render) and the operator may want to audition several in
+ *  a row, so they do NOT share the test endpoint's 10s cooldown. */
+const PREVIEW_COOLDOWN_MS = 2_000;
 /** Prune cached announcements older than this on each tick. 7 days
  *  comfortably covers repeated identical alerts within a week without
  *  letting cruft pile up indefinitely. */
@@ -194,6 +228,7 @@ export function startBroadcastMonitor(
   let lastOutcome: BroadcastStatus['lastOutcome'] = null;
   let lastErrors: string[] = [];
   let lastTestAt = 0;
+  let lastPreviewAt = 0; // v0.11.0 — per-priority preview cooldown gate.
   let musicAssistantAvailable = false;
   let wyomingReachable: boolean | null = null;
   let lastSpokenMessage: string | null = null;
@@ -337,7 +372,12 @@ export function startBroadcastMonitor(
   const tick = async () => {
     if (stopped) return;
     cfg = loadBroadcastConfig();
-    const alerts = (store.get().alerts ?? []) as Alert[];
+    // v0.11.0 — drop alerts whose ISA priority has been silenced on the Alert
+    // Settings page BEFORE counting crit/warn, so a silenced priority never
+    // raises the condition level (and thus never triggers a chime/broadcast).
+    // The alerts stay in snapshot.alerts and remain visible in the UI — we only
+    // gate the audible annunciation here.
+    const alerts = ((store.get().alerts ?? []) as Alert[]).filter((a) => isPriorityEnabled(priorityOf(a)));
     const { level, crit } = conditionFromAlerts(alerts);
     if (firstTick) {
       firstTick = false;
@@ -404,10 +444,12 @@ export function startBroadcastMonitor(
       }
       lastTestAt = Date.now();
       await detectMusicAssistant();
+      // v0.11.0 — test announcements use the same ISA priority vocabulary as
+      // real alarms (was the colour-named "Red alert"/"Yellow alert").
       const message =
-        level === 'red' ? 'Test broadcast. Red alert. This is only a test.' :
-        level === 'yellow' ? 'Test broadcast. Yellow alert chime. This is only a test.' :
-        'Test broadcast. All clear chime. This is only a test.';
+        level === 'red' ? `Test broadcast. ${priorityAnnouncementPrefix('critical')} This is only a test.` :
+        level === 'yellow' ? `Test broadcast. ${priorityAnnouncementPrefix('medium')} This is only a test.` :
+        'Test broadcast. All clear. This is only a test.';
       const r = await runBroadcast(level, message);
       lastBroadcastAt = Date.now();
       lastLevel = level;
@@ -418,6 +460,93 @@ export function startBroadcastMonitor(
         messages: r.errors,
         cooldownRemainingMs: TEST_COOLDOWN_MS,
       };
+    },
+    // v0.11.0 — render (browser) or render+play (speakers) a per-priority
+    // preview announcement for the Alert Settings page. Uses the SAME
+    // renderAnnouncement(...) call as test()/runBroadcast so the audio (chime
+    // repeat + TTS) is identical to what a real alarm would sound like.
+    preview: async (priority: AlarmPriority, target: 'browser' | 'speakers') => {
+      cfg = loadBroadcastConfig();
+      const spokenText = previewMessageFor(priority);
+      const level = klaxonLevelForPriority(priority);
+
+      // Short, preview-only cooldown — independent of test()'s 10s gate.
+      const remaining = Math.max(0, lastPreviewAt + PREVIEW_COOLDOWN_MS - Date.now());
+      if (remaining > 0) {
+        return {
+          ok: false,
+          spokenText,
+          played: target,
+          error: `cooldown: wait ${Math.ceil(remaining / 1000)}s before previewing again`,
+          cooldownRemainingMs: remaining,
+        };
+      }
+      lastPreviewAt = Date.now();
+
+      // 1. Render combined klaxon + TTS WAV (cache-aware), exactly like
+      //    runBroadcast. This works even when broadcasts are disabled / no
+      //    targets are configured — a browser-target preview never touches MA.
+      const r = await renderAnnouncement({
+        level,
+        message: spokenText,
+        klaxonDir: opts.klaxonDir,
+        cacheDir: opts.cacheDir,
+        wyomingHost: cfg.wyomingHost,
+        wyomingPort: cfg.wyomingPort,
+        wyomingVoice: cfg.wyomingVoice ?? undefined,
+        log,
+      });
+      lastRender = {
+        filename: r.filename ?? null,
+        sizeBytes: r.sizeBytes ?? null,
+        ttsRenderMs: r.ttsRenderMs ?? null,
+        fromCache: r.fromCache ?? null,
+        error: r.error ?? null,
+      };
+      if (!r.ok || !r.filename) {
+        wyomingReachable = false;
+        return { ok: false, spokenText, played: target, error: `render: ${r.error ?? 'unknown'}` };
+      }
+      wyomingReachable = true; // a TTS render succeeded
+      lastSpokenMessage = spokenText;
+      // Path is relative (no leading slash) so the browser fetches it via
+      // apiUrl(audioPath); the server serves it at /audio-render/<file>.
+      const audioPath = `audio-render/${r.filename}`;
+
+      // 2. Browser target → render only; the web app plays the WAV itself.
+      if (target === 'browser') {
+        return { ok: true, spokenText, audioPath, played: 'browser' };
+      }
+
+      // 3. Speakers target → ALSO play to the configured MA targets, exactly
+      //    like test()/runBroadcast.
+      if (!supervised) {
+        return { ok: false, spokenText, audioPath, played: 'speakers', error: 'not supervised' };
+      }
+      if (cfg.targets.length === 0) {
+        return { ok: false, spokenText, audioPath, played: 'speakers', error: 'no targets configured' };
+      }
+      await detectMusicAssistant();
+      const url = `${cfg.audioBase}${opts.cacheUrlPath}/${r.filename}`;
+      const announceVolume = Math.round(cfg.volume * 100);
+      const call = await callHaService('music_assistant', 'play_announcement', {
+        entity_id: cfg.targets,
+        url,
+        use_pre_announce: false,
+        announce_volume: announceVolume,
+      });
+      lastBroadcastAt = Date.now();
+      lastLevel = level;
+      if (!call.ok) {
+        const err = `music_assistant.play_announcement: ${call.error ?? call.status}`;
+        lastOutcome = 'partial';
+        lastErrors = [err];
+        return { ok: false, spokenText, audioPath, played: 'speakers', error: err };
+      }
+      lastOutcome = 'success';
+      lastErrors = [];
+      log(`broadcast: preview ${priority} (${level}) → played to ${cfg.targets.length} target(s)`);
+      return { ok: true, spokenText, audioPath, played: 'speakers' };
     },
     config: () => cfg,
     status: () => ({

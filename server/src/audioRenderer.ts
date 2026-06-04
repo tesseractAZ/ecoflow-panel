@@ -9,10 +9,10 @@
  * Layout:
  *
  *     ┌───────────────────────┬────────────────────────────────────┐
- *     │ klaxon (red/yellow/g) │ piper TTS rendering of the message │
+ *     │ klaxon × N (default 2) │ piper TTS rendering of the message │
  *     └───────────────────────┴────────────────────────────────────┘
  *      ~1.4 s (yellow/green)   ~0.5–6 s depending on message length
- *      ~3.0 s (red)
+ *      ~3.0 s (red), × N       (N = getChimeRepeat(), part of cache key)
  *
  * Why combine into one WAV instead of two play_announcement calls:
  *
@@ -28,8 +28,8 @@
  *
  *   - Repeated alerts (same level, same message — e.g. the same offline-
  *     device alert re-firing every 10 min) skip the Wyoming roundtrip.
- *   - Cache key = sha1(version || level || message), so message changes
- *     bust the cache automatically.
+ *   - Cache key = sha1(version || level || chimeRepeat || message), so a
+ *     message change OR a chime-repeat change busts the cache automatically.
  *   - Per-render version prefix in the key lets us invalidate every
  *     cached file by bumping the constant (without touching disk).
  *
@@ -50,6 +50,7 @@ import { readFile, writeFile, mkdir, access, readdir, stat, unlink } from 'node:
 import { existsSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
 import { renderWyomingTts, pcmToWav } from './wyomingTts.js';
+import { getChimeRepeat } from './alertSettings.js';
 
 /** Bump when the render pipeline changes in a way that invalidates the cache. */
 export const RENDER_VERSION = 1;
@@ -109,10 +110,16 @@ const KLAXON_FOR_LEVEL: Record<AnnouncementLevel, string> = {
 export async function renderAnnouncement(opts: RenderOptions): Promise<RenderResult> {
   const { level, message, klaxonDir, cacheDir, wyomingHost, wyomingPort, wyomingVoice, log } = opts;
 
-  // Cache key derivation: stable for the same (version, level, message).
+  // v0.11.0 — chime repeats getChimeRepeat() times (default 2) before the TTS.
+  // Resolve N once here so it's part of both the rendered audio AND the cache
+  // key — changing the repeat count must invalidate any previously cached file.
+  const chimeRepeat = Math.max(1, getChimeRepeat());
+
+  // Cache key derivation: stable for the same (version, level, message, repeat).
   // Null message hashes distinctly from empty string so klaxon-only and
-  // empty-spoken-message don't share a cache slot.
-  const keyInput = `v${RENDER_VERSION}|${level}|${message ?? '<null>'}`;
+  // empty-spoken-message don't share a cache slot. The repeat count is part of
+  // the key so bumping it (or the settings change) busts the cache.
+  const keyInput = `v${RENDER_VERSION}|${level}|x${chimeRepeat}|${message ?? '<null>'}`;
   const hash = createHash('sha1').update(keyInput).digest('hex').slice(0, 16);
   const filename = `${hash}.wav`;
   const outPath = resolve(cacheDir, filename);
@@ -140,13 +147,21 @@ export async function renderAnnouncement(opts: RenderOptions): Promise<RenderRes
     return { ok: false, error: `klaxon WAV malformed: ${klaxonPath}` };
   }
 
-  // No TTS → klaxon-only path. Cache the klaxon directly under the hash
-  // so the HTTP serving path is uniform.
+  // No TTS → klaxon-only path. Cache the klaxon under the hash so the HTTP
+  // serving path is uniform. v0.11.0 — repeat the chime N times so a chime-
+  // only announcement matches the repeat applied on the chime+TTS path. When
+  // N == 1 this is byte-identical to the original klaxon WAV.
   if (!message || message.trim().length === 0) {
     try {
       await mkdir(cacheDir, { recursive: true });
-      await writeFile(outPath, klaxonWav);
-      return { ok: true, filename, sizeBytes: klaxonWav.length, fromCache: false };
+      let klaxonOnly = klaxonWav;
+      if (chimeRepeat > 1) {
+        const klaxonPcm = klaxonWav.subarray(klaxonHeader.dataOffset, klaxonHeader.dataOffset + klaxonHeader.dataLength);
+        const repeatedPcm = Buffer.concat(Array<Buffer>(chimeRepeat).fill(klaxonPcm));
+        klaxonOnly = pcmToWav(repeatedPcm, klaxonHeader.rate, klaxonHeader.width, klaxonHeader.channels);
+      }
+      await writeFile(outPath, klaxonOnly);
+      return { ok: true, filename, sizeBytes: klaxonOnly.length, fromCache: false };
     } catch (e: any) {
       return { ok: false, error: `cache write failed: ${e?.message ?? e}` };
     }
@@ -180,10 +195,12 @@ export async function renderAnnouncement(opts: RenderOptions): Promise<RenderRes
     };
   }
 
-  // Concat PCM data, rebuild header.
+  // Concat PCM data, rebuild header. v0.11.0 — the chime plays chimeRepeat
+  // times (default 2) before the spoken TTS, so the operator hears the klaxon
+  // twice then the announcement.
   const klaxonPcm = klaxonWav.subarray(klaxonHeader.dataOffset, klaxonHeader.dataOffset + klaxonHeader.dataLength);
   const ttsPcm = ttsResult.wav.subarray(ttsHeader.dataOffset, ttsHeader.dataOffset + ttsHeader.dataLength);
-  const combinedPcm = Buffer.concat([klaxonPcm, ttsPcm]);
+  const combinedPcm = Buffer.concat([...Array<Buffer>(chimeRepeat).fill(klaxonPcm), ttsPcm]);
   const combined = pcmToWav(combinedPcm, klaxonHeader.rate, klaxonHeader.width, klaxonHeader.channels);
 
   // Write atomically (tmp → rename) so a half-written file never serves.
@@ -272,10 +289,16 @@ export async function pruneRenderCache(cacheDir: string, maxAgeMs: number, log: 
   return removed;
 }
 
-/** Hash function exposed for tests so the cache-key format is pinned. */
-export function renderCacheKey(level: AnnouncementLevel, message: string | null): string {
+/**
+ * Hash function exposed for tests so the cache-key format is pinned.
+ * v0.11.0 — the chime-repeat count is part of the key (changing it busts the
+ * cache). Defaults to the live getChimeRepeat() so callers/tests that don't
+ * pass it match what renderAnnouncement() would produce.
+ */
+export function renderCacheKey(level: AnnouncementLevel, message: string | null, chimeRepeat?: number): string {
+  const repeat = Math.max(1, chimeRepeat ?? getChimeRepeat());
   return createHash('sha1')
-    .update(`v${RENDER_VERSION}|${level}|${message ?? '<null>'}`)
+    .update(`v${RENDER_VERSION}|${level}|x${repeat}|${message ?? '<null>'}`)
     .digest('hex')
     .slice(0, 16);
 }

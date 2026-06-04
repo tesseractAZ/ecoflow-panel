@@ -15,6 +15,16 @@ import { BridgePanel } from '../components/BridgePanel';
 import { AlertOutcomeButtons } from '../../components/AlertOutcomeButtons';
 import type { FleetSnapshot } from '../../types';
 import type { Alert } from '../../types';
+// v0.11.0 — threat list labelled/coloured by ISA priority (CRIT/HIGH/MED/LOW).
+import { priorityOf, priorityMeta, type AlarmPriority } from '../../alertPriority';
+
+/** Theme colour per ISA priority, read from the active theme's CSS variables. */
+const PRIORITY_VAR: Record<AlarmPriority, string> = {
+  critical: 'rgb(var(--color-bad))',
+  high: 'rgb(var(--color-high))',
+  medium: 'rgb(var(--color-warn))',
+  low: 'rgb(var(--color-info))',
+};
 
 export function Tactical({ snapshot }: { snapshot: FleetSnapshot | null }) {
   if (!snapshot) {
@@ -68,8 +78,9 @@ export function Tactical({ snapshot }: { snapshot: FleetSnapshot | null }) {
           ) : (
             <div className="space-y-1 max-h-[480px] overflow-y-auto pr-1">
               {[...crit, ...warn, ...info].map((a, i) => {
-                const sevColor = a.severity === 'critical' ? '#c4242a' : a.severity === 'warning' ? '#e89c40' : '#4a86c6';
-                const sevLabel = a.severity === 'critical' ? 'CRIT' : a.severity === 'warning' ? 'WARN' : 'INFO';
+                const priority = priorityOf(a);
+                const sevColor = PRIORITY_VAR[priority];
+                const sevLabel = priorityMeta(priority).tag; // CRIT / HIGH / MED / LOW
                 return (
                   <div key={i} className="grid grid-cols-[60px_120px_1fr] gap-2 items-start px-2 py-1.5" style={{
                     background: 'rgba(20,14,8,0.6)',

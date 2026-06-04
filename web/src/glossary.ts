@@ -118,13 +118,28 @@ def('data span', 'Days of recorded history the projection is regressed over.');
 def('projection notes', 'Plain-language end-of-life verdict for each pack with a firm fade trend.');
 def('trend', 'Whether a pack has a projected fade trend, is stable, is still learning, or has no data yet.');
 
-/* ── Alerts ── */
-def('critical', 'Critical — an immediate problem that needs attention now.');
-def('warnings|warning', 'Warning — something to investigate soon.');
-def('informational|info', 'Informational — noted for awareness, not urgent.');
+/* ── Alerts — ISA-18.2 / IEC 62682 priority taxonomy ── */
+// Priorities mirror PRIORITY_META in alertPriority.ts. Legacy severity keys
+// (warning / info) are kept as aliases so existing label sites still resolve.
+def(
+  'critical|crit|p1|priority 1',
+  'Critical (P1) — immediate action required to protect people, the battery, or the plant from imminent harm.',
+);
+def(
+  'high|high priority|p2|priority 2',
+  'High (P2) — a protective hardware limit has been crossed. Prompt operator action is needed.',
+);
+def(
+  'medium|med|warning|warnings|p3|priority 3',
+  'Medium (P3) — a learned/statistical anomaly deviating from the normal baseline. Investigate before it escalates.',
+);
+def(
+  'low|info|informational|p4|priority 4',
+  'Low (P4) — advisory for situational awareness. No immediate action expected.',
+);
 def('anomalies', 'Things unusual right now — flagged by peer comparison and self-baseline.');
 def('forecasts', 'Where things are heading — runtime, degradation and day-ahead projections.');
-def('actionable', 'Critical + warning items that may need attention.');
+def('actionable', 'Critical, High & Medium items that may need attention.');
 def('recently cleared', 'Alerts that were raised and have since resolved, with how long each lasted.');
 
 /* ── Misc ── */

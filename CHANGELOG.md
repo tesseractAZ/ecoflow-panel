@@ -3,6 +3,63 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.11.0 — 2026-06-04
+
+**Industrial alarm-priority taxonomy (ISA-18.2 / IEC 62682) + an Alert Settings page to silence annunciation per priority, the chime sounding twice, and per-priority announcement preview — mirrored as HA switches.**
+
+The panel had three ad-hoc severity LABELS (critical / warning / info). This
+release layers a proper 4-tier industrial alarm PRIORITY on top — Critical (P1) /
+High (P2) / Medium (P3) / Low (P4) — the taxonomy used for alarm management in
+process & power plants. It's a presentation change only: the internal
+`severity` ('critical'|'warning'|'info') + `source` ('threshold'|'learned')
+literals are UNCHANGED (they're load-bearing in ~200 places — MQTT entity ids
+like `alert_critical_count`, notify priority maps, ~340 tests), so Home
+Assistant history and external tooling don't break. Priority is DERIVED:
+
+| severity | source | → priority |
+| --- | --- | --- |
+| critical | (any) | Critical (P1) |
+| warning | threshold | High (P2) |
+| warning | learned | Medium (P3) |
+| info | (any) | Low (P4) |
+
+The **High-vs-Medium split is itself ISA-18.2 logic**: a deterministic
+threshold breach (a hardware/protective limit crossed) is more certain and more
+actionable than a learned/statistical anomaly, so threshold→High and
+learned→Medium. A warning with no recorded source collapses to High (the more
+conservative home). The mapping lives in one place (`server/src/alertPriority.ts`,
+mirrored at `web/src/alertPriority.ts`); the server, web app, HACS cards and TUI
+all derive labels/colours from it.
+
+**New "Alert Settings" web page.** Enable/disable annunciation per priority and
+set the chime-repeat count. Disabling a priority silences its *annunciation*
+(push notification + audible broadcast + chime) — it does NOT hide the alarm:
+per alarm-management best practice you never make an active condition invisible,
+you only adjust how loudly it announces itself. Silenced priorities still render
+in the alert lists with a muted "silenced" marker. The toggles persist to
+`/data/alert-settings.json` (atomic temp-file + rename) so they survive add-on
+restarts, independent of the env-derived `NOTIFY_*` / `BROADCAST_*` baseline.
+
+**The alert chime now sounds TWICE on a new alarm** (was once), configurable
+1–4 from the Alert Settings page. The repeat count is part of the rendered-audio
+cache key, so each setting renders/caches its own klaxon-times-N + spoken-TTS clip.
+
+**Per-priority announcement preview.** Each priority has a "preview" button that
+plays exactly what that priority sounds like (chime + spoken voice) without
+waiting for a real alarm — playable either in the **browser** or out loud on the
+**HA speakers** (the configured `BROADCAST_TARGETS`). New
+`POST /api/alert-preview` (write-auth) renders the representative announcement
+and returns the spoken text + an `audio-render/<file>.wav` path the browser can
+play.
+
+**Mirrored as Home Assistant switches.** Each priority toggle is published via
+MQTT Discovery as `switch.ecoflow_alerts_<priority>` (critical / high / medium /
+low), so you can flip annunciation on/off from HA automations or the dashboard —
+state stays in lockstep with the web page in both directions.
+
+New contract endpoints: `GET /api/alert-settings` (no auth),
+`PUT /api/alert-settings` (write-auth), `POST /api/alert-preview` (write-auth).
+
 ## 0.10.4 — 2026-06-04
 
 **7-day real-world audit fixes (P0–P3): MQTT self-heal + data-correctness across the derived energy/forecast/degradation surfaces.**

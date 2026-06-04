@@ -1,6 +1,7 @@
 import type { Alert } from '../types';
-import { SEV_META, SubjectBoxes, sevRank } from '../cards/AlertParts';
-import { alertCounts } from '../alerts';
+import { SubjectBoxes } from '../cards/AlertParts';
+// v0.11.0 — label learned signals by ISA priority (learned warnings → Medium, learned info → Low).
+import { priorityOf, priorityMeta, priorityCounts } from '../alertPriority';
 import { ForecastDetail } from '../cards/ForecastDetail';
 import { DegradationCard } from '../cards/DegradationCard';
 import { AdvancedInsightsCard } from '../cards/AdvancedInsightsCard';
@@ -12,10 +13,12 @@ import { AdvancedInsightsCard } from '../cards/AdvancedInsightsCard';
  * degradation, day-ahead). The plain Alerts page keeps the fixed-threshold rules.
  */
 export function PredictiveInsights({ alerts }: { alerts: Alert[] }) {
-  const bySev = (xs: Alert[]) => [...xs].sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
-  const anomalies = bySev(alerts.filter((a) => !a.id.startsWith('forecast-')));
-  const forecasts = bySev(alerts.filter((a) => a.id.startsWith('forecast-')));
-  const counts = alertCounts(alerts);
+  // Sort by ISA priority — most-severe first.
+  const byPriority = (xs: Alert[]) =>
+    [...xs].sort((a, b) => priorityMeta(priorityOf(a)).rank - priorityMeta(priorityOf(b)).rank);
+  const anomalies = byPriority(alerts.filter((a) => !a.id.startsWith('forecast-')));
+  const forecasts = byPriority(alerts.filter((a) => a.id.startsWith('forecast-')));
+  const counts = priorityCounts(alerts);
 
   return (
     <div className="space-y-4">
@@ -34,10 +37,10 @@ export function PredictiveInsights({ alerts }: { alerts: Alert[] }) {
           <CountTile label="Forecasts" value={forecasts.length} accent={forecasts.length ? 'text-accent' : 'text-muted'} />
           <CountTile
             label="Actionable"
-            value={counts.critical + counts.warning}
-            accent={counts.critical + counts.warning ? 'text-warn' : 'text-muted'}
+            value={counts.critical + counts.high + counts.medium}
+            accent={counts.critical + counts.high + counts.medium ? 'text-warn' : 'text-muted'}
           />
-          <CountTile label="Informational" value={counts.info} accent="text-muted" />
+          <CountTile label="Low" value={counts.low} accent="text-muted" />
         </div>
       </div>
 
@@ -98,7 +101,7 @@ function Section({
 }
 
 function InsightCard({ alert }: { alert: Alert }) {
-  const meta = SEV_META[alert.severity];
+  const meta = priorityMeta(priorityOf(alert));
   return (
     <div className={`flex items-stretch gap-3 bg-panel2/50 border ${meta.ring} rounded-lg p-3`}>
       <SubjectBoxes alert={alert} />

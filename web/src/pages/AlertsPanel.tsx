@@ -1,8 +1,15 @@
 import { useEffect, useState } from 'react';
-import type { Alert, Severity, ClearedAlert } from '../types';
-import { alertCounts } from '../alerts';
+import type { Alert, ClearedAlert } from '../types';
 import { fmtRel, fmtMins } from '../format';
-import { SEV_META, SubjectBoxes } from '../cards/AlertParts';
+import { SubjectBoxes } from '../cards/AlertParts';
+// v0.11.0 — group + colour the alert list by ISA priority (Critical/High/Medium/Low).
+import {
+  priorityOf,
+  priorityCounts,
+  PRIORITY_META,
+  ALARM_PRIORITY_ORDER,
+  type PriorityMeta,
+} from '../alertPriority';
 import { AlertOutcomeButtons } from '../components/AlertOutcomeButtons';
 import { apiUrl } from '../api';
 
@@ -18,40 +25,51 @@ interface NotifyStatus {
 }
 
 export function AlertsPanel({ alerts }: { alerts: Alert[] }) {
-  const counts = alertCounts(alerts);
-  const actionable = alerts.filter((a) => a.severity !== 'info');
+  const counts = priorityCounts(alerts);
+  // "Actionable" = anything above the advisory (Low / P4) tier.
+  const actionable = alerts.filter((a) => priorityOf(a) !== 'low');
 
   return (
     <div className="space-y-4">
-      {/* Summary */}
+      {/* Summary — four ISA priority tiles */}
       <div className="card">
         <div className="card-title flex items-center justify-between">
           <span>System alerts</span>
           <span className="text-xs text-muted normal-case tracking-normal">{alerts.length} item(s) flagged</span>
         </div>
-        <div className="grid grid-cols-3 gap-3">
-          <CountTile label="Critical" value={counts.critical} accent={counts.critical > 0 ? 'text-bad' : 'text-muted'} />
-          <CountTile label="Warnings" value={counts.warning} accent={counts.warning > 0 ? 'text-warn' : 'text-muted'} />
-          <CountTile label="Informational" value={counts.info} accent="text-muted" />
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {ALARM_PRIORITY_ORDER.map((p) => {
+            const meta = PRIORITY_META[p];
+            return (
+              <CountTile
+                key={p}
+                label={meta.label}
+                isa={meta.isa}
+                value={counts[p]}
+                accent={counts[p] > 0 ? meta.text : 'text-muted'}
+              />
+            );
+          })}
         </div>
         {actionable.length === 0 && (
           <div className="mt-3 flex items-center gap-2 text-sm text-ok">
             <span className="h-2 w-2 rounded-full bg-ok inline-block" />
-            All systems nominal — no critical or warning conditions across the fleet.
+            All systems nominal — no Critical, High, or Medium conditions across the fleet.
           </div>
         )}
       </div>
 
-      {/* Grouped by severity */}
-      {(['critical', 'warning', 'info'] as Severity[]).map((sev) => {
-        const group = alerts.filter((a) => a.severity === sev);
+      {/* Grouped by ISA priority (Critical → High → Medium → Low) */}
+      {ALARM_PRIORITY_ORDER.map((p) => {
+        const group = alerts.filter((a) => priorityOf(a) === p);
         if (group.length === 0) return null;
-        const meta = SEV_META[sev];
+        const meta = PRIORITY_META[p];
         return (
-          <div key={sev} className="card">
+          <div key={p} className="card">
             <div className="card-title flex items-center gap-2">
               <span className={`h-2 w-2 rounded-full ${meta.dot} inline-block`} />
               <span>{meta.label}</span>
+              <span className={`badge ${meta.badge} text-[10px]`}>{meta.isa}</span>
               <span className="text-muted normal-case tracking-normal">({group.length})</span>
             </div>
             <div className="space-y-2">
@@ -238,7 +256,7 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function AlertRow({ alert, meta }: { alert: Alert; meta: (typeof SEV_META)[Severity] }) {
+function AlertRow({ alert, meta }: { alert: Alert; meta: PriorityMeta }) {
   return (
     <div className={`flex items-stretch gap-3 bg-panel2/50 border ${meta.ring} rounded-lg p-3`}>
       <SubjectBoxes alert={alert} />
@@ -258,11 +276,14 @@ function AlertRow({ alert, meta }: { alert: Alert; meta: (typeof SEV_META)[Sever
   );
 }
 
-function CountTile({ label, value, accent }: { label: string; value: number; accent: string }) {
+function CountTile({ label, value, accent, isa }: { label: string; value: number; accent: string; isa?: string }) {
   return (
     <div className="bg-panel2/60 border border-line rounded-xl p-3 text-center">
       <div className={`text-3xl font-bold tabular-nums ${accent}`}>{value}</div>
-      <div className="text-[10px] uppercase tracking-widest text-muted mt-1">{label}</div>
+      <div className="text-[10px] uppercase tracking-widest text-muted mt-1">
+        {label}
+        {isa && <span className="ml-1 normal-case tracking-normal opacity-70">{isa}</span>}
+      </div>
     </div>
   );
 }

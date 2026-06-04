@@ -19,6 +19,10 @@ export default {
         ok: 'rgb(var(--color-ok) / <alpha-value>)',
         warn: 'rgb(var(--color-warn) / <alpha-value>)',
         bad: 'rgb(var(--color-bad) / <alpha-value>)',
+        // v0.11.0 — ISA-18.2 alarm-priority ramp: High (orange, P2) and
+        // Low/info (blue, P4). Critical reuses `bad`, Medium reuses `warn`.
+        high: 'rgb(var(--color-high) / <alpha-value>)',
+        info: 'rgb(var(--color-info) / <alpha-value>)',
       },
       fontFamily: {
         // CSS variables let the B5 theme swap fonts without touching JSX.

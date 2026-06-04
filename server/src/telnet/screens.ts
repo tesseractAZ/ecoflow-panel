@@ -11,8 +11,10 @@ import type { FleetSnapshot, DeviceSnapshot } from '../snapshot.js';
 import type { DpuProjection, DpuPack, Shp2Projection } from '../ecoflow/project.js';
 import type { FleetEnergyTotals } from '../aggregator.js';
 import type { DayForecast, FleetDegradation } from '../analytics.js';
-import type { Alert, Severity } from '../alerts.js';
+import type { Alert } from '../alerts.js';
 import { c, BOX, padEnd, padStart, truncate, center, lr, bar, visLen } from './ansi.js';
+// v0.11.0 — derive the 4-tier ISA-18.2 / IEC 62682 alarm priority for display.
+import { priorityOf, priorityMeta, comparePriority, type AlarmPriority } from '../alertPriority.js';
 
 export const SCREENS = ['overview', 'devices', 'solar', 'battery', 'shp2', 'charger', 'strategy', 'alerts', 'predictive'] as const;
 export type ScreenId = (typeof SCREENS)[number];
@@ -250,8 +252,8 @@ function statusLine(data: RenderData, w: number): string {
   const backup = shp2?.projection.backupBatPercent ?? null;
   const offGrid = acIn < 5;
   const alerts = snap.alerts ?? [];
-  const crit = alerts.filter((a) => a.severity === 'critical').length;
-  const warn = alerts.filter((a) => a.severity === 'warning').length;
+  // v0.11.0 — count by the 4-tier ISA priority instead of raw severity.
+  const pc = prioCounts(alerts);
 
   const seg: string[] = [];
   seg.push(offGrid ? c.yellowB('OFF-GRID') : c.greenB('GRID-TIED'));
@@ -260,9 +262,11 @@ function statusLine(data: RenderData, w: number): string {
   seg.push(c.grey('LOAD ') + c.white(fmtW(load)));
   const arrow = batNet > 5 ? c.yellow('▼ ') : batNet < -5 ? c.green('▲ ') : '';
   seg.push(c.grey('BATT ') + arrow + c.white(fmtW(Math.abs(batNet))));
-  if (crit > 0) seg.push(c.redB(`${crit} CRIT`));
-  if (warn > 0) seg.push(c.yellowB(`${warn} WARN`));
-  if (crit === 0 && warn === 0) seg.push(c.green('NOMINAL'));
+  if (pc.critical > 0) seg.push(prioColor('critical')(`${pc.critical} CRIT`));
+  if (pc.high > 0) seg.push(prioColor('high')(`${pc.high} HIGH`));
+  if (pc.medium > 0) seg.push(prioColor('medium')(`${pc.medium} MED`));
+  if (pc.low > 0) seg.push(prioColor('low')(`${pc.low} LOW`));
+  if (pc.critical === 0 && pc.high === 0 && pc.medium === 0 && pc.low === 0) seg.push(c.green('NOMINAL'));
 
   return padEnd(seg.join(c.grey('  │  ')), w);
 }
@@ -913,16 +917,25 @@ function bodyStrategy(data: RenderData): string[] {
 
 /* ───────────────────────── ALERTS + PREDICTIVE ───────────────────────── */
 
-function sevRank(s: Severity): number {
-  return s === 'critical' ? 0 : s === 'warning' ? 1 : 2;
-}
 /** "1 alert" / "3 alerts" — count with a correctly pluralized noun. */
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
-/** Fixed 4-column severity tag. */
-function sevTag(s: Severity): string {
-  return s === 'critical' ? c.redB('CRIT') : s === 'warning' ? c.yellowB('WARN') : c.cyan('INFO');
+/** ANSI colourizer for an ISA priority. No orange in the 16-colour TUI palette,
+ *  so High shares Critical's bright-red; Medium = bright-yellow; Low = cyan. */
+function prioColor(p: AlarmPriority): (s: string) => string {
+  return p === 'critical' ? c.redB : p === 'high' ? c.redB : p === 'medium' ? c.yellowB : c.cyan;
+}
+/** Priority tag (CRIT/HIGH/MED/LOW) coloured for the alarm rows. */
+function prioTag(a: Alert): string {
+  const p = priorityOf(a);
+  return prioColor(p)(priorityMeta(p).tag);
+}
+/** Tally a list of alerts into the four ISA priority buckets. */
+function prioCounts(alerts: Alert[]): Record<AlarmPriority, number> {
+  const out: Record<AlarmPriority, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const a of alerts) out[priorityOf(a)]++;
+  return out;
 }
 
 /** Two stacked subject cells — Core then Pack — as 9-wide inverse-video boxes. */
@@ -1040,20 +1053,20 @@ function wrapFacts(facts: Array<{ label: string; value: string }>, width: number
 function bodyAlerts(sv: SessionView, data: RenderData, w: number, h: number): string[] {
   const alerts = (data.snap.alerts ?? [])
     .filter((a) => a.source !== 'learned')
-    .sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
-  const crit = alerts.filter((a) => a.severity === 'critical').length;
-  const warn = alerts.filter((a) => a.severity === 'warning').length;
-  const info = alerts.filter((a) => a.severity === 'info').length;
+    .sort((a, b) => comparePriority(priorityOf(a), priorityOf(b)));
+  const pc = prioCounts(alerts);
 
   const L: string[] = [];
   L.push(
     c.cyanB(plural(alerts.length, 'THRESHOLD ALERT', 'THRESHOLD ALERTS')) +
       c.grey('     ') +
-      c.red(`${crit} critical`) +
+      prioColor('critical')(`${pc.critical} critical`) +
       c.grey(' · ') +
-      c.yellow(`${warn} warning`) +
+      prioColor('high')(`${pc.high} high`) +
       c.grey(' · ') +
-      c.white(`${info} info`),
+      prioColor('medium')(`${pc.medium} medium`) +
+      c.grey(' · ') +
+      prioColor('low')(`${pc.low} low`),
   );
   L.push(rule(w));
   if (alerts.length === 0) {
@@ -1065,7 +1078,7 @@ function bodyAlerts(sv: SessionView, data: RenderData, w: number, h: number): st
     const [c1, c2] = subjectCells(a);
     const detail = wrapText(a.detail, w - 15);
     const block = [
-      c1 + ' ' + sevTag(a.severity) + ' ' + lr(c.whiteB(a.title), c.grey(a.category), w - 15),
+      c1 + ' ' + prioTag(a) + ' ' + lr(c.whiteB(a.title), c.grey(a.category), w - 15),
       c2 + '      ' + c.grey(detail[0] ?? ''),
     ];
     for (const extra of detail.slice(1)) block.push(' '.repeat(15) + c.grey(extra));
@@ -1078,10 +1091,10 @@ function bodyPredictive(sv: SessionView, data: RenderData, w: number, h: number)
   const learned = (data.snap.alerts ?? []).filter((a) => a.source === 'learned');
   const anomalies = learned
     .filter((a) => !a.id.startsWith('forecast-'))
-    .sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
+    .sort((a, b) => comparePriority(priorityOf(a), priorityOf(b)));
   const forecasts = learned
     .filter((a) => a.id.startsWith('forecast-'))
-    .sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
+    .sort((a, b) => comparePriority(priorityOf(a), priorityOf(b)));
 
   const L: string[] = [];
   L.push(
@@ -1102,7 +1115,7 @@ function bodyPredictive(sv: SessionView, data: RenderData, w: number, h: number)
     const [c1, c2] = subjectCells(a);
     const detail = wrapText(a.detail, w - 15);
     const block = [
-      c1 + ' ' + sevTag(a.severity) + ' ' + lr(c.whiteB(a.title), c.grey(a.category), w - 15),
+      c1 + ' ' + prioTag(a) + ' ' + lr(c.whiteB(a.title), c.grey(a.category), w - 15),
       c2 + '      ' + c.grey(detail[0] ?? ''),
     ];
     for (const extra of detail.slice(1)) block.push(' '.repeat(15) + c.grey(extra));

@@ -16,6 +16,10 @@ import {
   computeCarbonReport,
   computeTariffReport,
 } from './analytics.js';
+// v0.11.0 — mirror the per-ISA-priority alarm on/off toggles as HA switch
+// entities and the per-priority alarm counts as sensors.
+import { ALARM_PRIORITY_ORDER, ALARM_PRIORITY_META, priorityOf, type AlarmPriority } from './alertPriority.js';
+import { getAlertSettings, updateAlertSettings, onAlertSettingsChange } from './alertSettings.js';
 
 /**
  * MQTT Discovery publisher for Home Assistant (v0.7.5).
@@ -46,6 +50,15 @@ const DEVICE_INFO = {
 const STATE_TOPIC = 'ecoflow_panel/state';
 const AVAILABILITY_TOPIC = 'ecoflow_panel/availability';
 const PUBLISH_INTERVAL_MS = 30 * 1000;
+
+// v0.11.0 — per-priority alarm on/off switch topics. Each ISA priority gets a
+// dedicated state + command topic under the same `ecoflow_panel` base prefix
+// the other entities use. The switch object/unique id is `ecoflow_alerts_<p>`.
+const alertSwitchUniqueId = (p: AlarmPriority) => `ecoflow_alerts_${p}`;
+const alertSwitchStateTopic = (p: AlarmPriority) => `ecoflow_panel/alerts/${p}/state`;
+const alertSwitchCommandTopic = (p: AlarmPriority) => `ecoflow_panel/alerts/${p}/set`;
+const SWITCH_ON = 'ON';
+const SWITCH_OFF = 'OFF';
 
 export interface SensorConfig {
   unique_id: string;
@@ -91,10 +104,17 @@ export const SENSORS: SensorConfig[] = [
   // Self-consumption (v0.7.5)
   { unique_id: 'ecoflow_solar_fraction_of_load', name: 'EcoFlow Solar Fraction of Load', state_class: 'measurement', unit_of_measurement: '%', icon: 'mdi:solar-power', value_template: '{{ value_json.solar_fraction_of_load_percent }}' },
   { unique_id: 'ecoflow_direct_use_ratio', name: 'EcoFlow PV Direct Use Ratio', state_class: 'measurement', unit_of_measurement: '%', icon: 'mdi:transmission-tower-import', value_template: '{{ value_json.direct_use_ratio_percent }}' },
-  // Alert counts
+  // Alert counts — these legacy entity-ids are load-bearing (HA history depends
+  // on them); do NOT rename or remove.
   { unique_id: 'ecoflow_alert_critical_count', name: 'EcoFlow Critical Alerts', state_class: 'measurement', icon: 'mdi:alert-octagon', value_template: '{{ value_json.alert_critical_count }}' },
   { unique_id: 'ecoflow_alert_warning_count', name: 'EcoFlow Warning Alerts', state_class: 'measurement', icon: 'mdi:alert', value_template: '{{ value_json.alert_warning_count }}' },
   { unique_id: 'ecoflow_learned_warning_count', name: 'EcoFlow Learned Warnings', state_class: 'measurement', icon: 'mdi:lightbulb-on', value_template: '{{ value_json.learned_warning_count }}' },
+  // v0.11.0 — additive per-ISA-priority alarm counts (Critical already exposed
+  // above via alert_critical_count; these cover High/Medium/Low). Derived from
+  // priorityOf(alert) so they track the same 4-tier taxonomy as the switches.
+  { unique_id: 'ecoflow_alert_high_count', name: 'EcoFlow High Priority Alarms (P2)', state_class: 'measurement', icon: 'mdi:alert', value_template: '{{ value_json.alert_high_count }}' },
+  { unique_id: 'ecoflow_alert_medium_count', name: 'EcoFlow Medium Priority Alarms (P3)', state_class: 'measurement', icon: 'mdi:alert-outline', value_template: '{{ value_json.alert_medium_count }}' },
+  { unique_id: 'ecoflow_alert_low_count', name: 'EcoFlow Low Priority Alarms (P4)', state_class: 'measurement', icon: 'mdi:information-outline', value_template: '{{ value_json.alert_low_count }}' },
   // Fleet
   { unique_id: 'ecoflow_fleet_devices_online', name: 'EcoFlow Fleet Devices Online', state_class: 'measurement', icon: 'mdi:home-battery', value_template: '{{ value_json.fleet_devices_online }}' },
   // ─── HA Energy Dashboard — monotonic lifetime counters (v0.7.6) ──────────
@@ -303,8 +323,46 @@ export async function startMqttDiscovery(
       }
       log(`mqtt-discovery: published ${circuits.length} per-circuit lifetime sensors`);
     }
+    // v0.11.0 — per-ISA-priority alarm on/off switches. Each mirrors the
+    // matching `priorityEnabled[p]` flag in alertSettings. optimistic=false so
+    // HA reflects the actual reported state_topic value (the server is the
+    // source of truth), and we attach the shared device block so the switches
+    // group under the same "EcoFlow Panel" device as every other entity.
+    for (const p of ALARM_PRIORITY_ORDER) {
+      const meta = ALARM_PRIORITY_META[p];
+      const uniqueId = alertSwitchUniqueId(p);
+      const topic = `${prefix}/switch/${uniqueId}/config`;
+      const cfg = {
+        unique_id: uniqueId,
+        name: `EcoFlow Alarms — ${meta.label} (${meta.isa})`,
+        state_topic: alertSwitchStateTopic(p),
+        command_topic: alertSwitchCommandTopic(p),
+        availability_topic: AVAILABILITY_TOPIC,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        payload_on: SWITCH_ON,
+        payload_off: SWITCH_OFF,
+        optimistic: false,
+        icon: 'mdi:bell-ring',
+        entity_category: 'config',
+        device: DEVICE_INFO,
+      };
+      client.publish(topic, JSON.stringify(cfg), { retain: true, qos: 0 });
+    }
     client.publish(AVAILABILITY_TOPIC, 'online', { retain: true, qos: 0 });
-    log(`mqtt-discovery: published ${SENSORS.length} sensor configs + ${BINARY_SENSORS.length} binary_sensor configs to ${url} (prefix=${prefix})`);
+    log(`mqtt-discovery: published ${SENSORS.length} sensor configs + ${BINARY_SENSORS.length} binary_sensor configs + ${ALARM_PRIORITY_ORDER.length} alarm-priority switches to ${url} (prefix=${prefix})`);
+  };
+
+  // v0.11.0 — publish the current on/off state for every priority switch.
+  // Retained so HA shows the right toggle position immediately on (re)connect.
+  // Guarded on connection so a publish during a disconnect is a no-op.
+  const publishSwitchStates = () => {
+    if (!client.connected) return;
+    const settings = getAlertSettings();
+    for (const p of ALARM_PRIORITY_ORDER) {
+      const on = settings.priorityEnabled[p] !== false;
+      client.publish(alertSwitchStateTopic(p), on ? SWITCH_ON : SWITCH_OFF, { retain: true, qos: 0 });
+    }
   };
 
   const buildState = async (snap: FleetSnapshot): Promise<Record<string, unknown>> => {
@@ -356,6 +414,8 @@ export async function startMqttDiscovery(
     const alerts = snap.alerts ?? [];
     const cnt = (src: 'threshold' | 'learned', sev: 'critical' | 'warning' | 'info') =>
       alerts.filter((a) => (src === 'learned' ? a.source === 'learned' : a.source !== 'learned') && a.severity === sev).length;
+    // v0.11.0 — per-ISA-priority counts via priorityOf (severity+source → P1..P4).
+    const priorityCount = (p: AlarmPriority) => alerts.filter((a) => priorityOf(a) === p).length;
     const kwh1 = (wh: number | null | undefined) => (wh == null ? null : Math.round(wh / 100) / 10);
     return {
       fleet_pv_watts: Math.round(fleetPv),
@@ -401,6 +461,10 @@ export async function startMqttDiscovery(
       alert_critical_count: cnt('threshold', 'critical'),
       alert_warning_count: cnt('threshold', 'warning'),
       learned_warning_count: cnt('learned', 'warning'),
+      // v0.11.0 — additive per-priority alarm counts (P1 Critical … P4 Low).
+      alert_high_count: priorityCount('high'),
+      alert_medium_count: priorityCount('medium'),
+      alert_low_count: priorityCount('low'),
       fleet_devices_online: devices.filter((d) => d.online).length,
     };
   };
@@ -415,6 +479,45 @@ export async function startMqttDiscovery(
     }
   };
 
+  // v0.11.0 — fast lookup from a switch command topic back to its priority,
+  // so the message handler can map an incoming ON/OFF to the right setting.
+  const commandTopicToPriority = new Map<string, AlarmPriority>(
+    ALARM_PRIORITY_ORDER.map((p) => [alertSwitchCommandTopic(p), p]),
+  );
+
+  // v0.11.0 — HA toggled a switch: apply it to alertSettings (source 'mqtt'),
+  // then echo the resolved state back to that switch's STATE topic. We publish
+  // to the STATE topic (not the COMMAND topic) so this never re-triggers the
+  // command handler — no feedback loop.
+  const handleSwitchCommand = (topic: string, payloadRaw: string) => {
+    const p = commandTopicToPriority.get(topic);
+    if (!p) return;
+    const payload = payloadRaw.trim().toUpperCase();
+    if (payload !== SWITCH_ON && payload !== SWITCH_OFF) return;
+    const enabled = payload === SWITCH_ON;
+    // updateAlertSettings notifies onAlertSettingsChange listeners (incl. the
+    // one below) which republishes ALL switch states — but publishing to the
+    // retained STATE topic here too keeps this priority's toggle snappy.
+    updateAlertSettings({ priorityEnabled: { [p]: enabled } }, 'mqtt');
+    if (client.connected) {
+      client.publish(alertSwitchStateTopic(p), enabled ? SWITCH_ON : SWITCH_OFF, { retain: true, qos: 0 });
+    }
+  };
+
+  client.on('message', (topic, payload) => {
+    try {
+      handleSwitchCommand(topic, payload.toString());
+    } catch (e: any) {
+      log(`mqtt-discovery: switch command handling failed — ${e?.message ?? e}`);
+    }
+  });
+
+  // v0.11.0 — keep HA switches in lockstep when the change originates elsewhere
+  // (e.g. the web "Alert Settings" page). Republish every switch state on any
+  // settings change. The 'mqtt'-sourced change above also lands here, but
+  // re-publishing the same retained STATE value is harmless and idempotent.
+  const unsubscribeSettings = onAlertSettingsChange(() => publishSwitchStates());
+
   client.on('connect', () => {
     log(`mqtt-discovery: connected to ${url}`);
     if (!published) {
@@ -424,7 +527,15 @@ export async function startMqttDiscovery(
       publishDiscovery();
       published = true;
     }
+    // Subscribe to every switch command topic (re-subscribe on each reconnect —
+    // MQTT subscriptions don't survive a clean session reconnect).
+    for (const p of ALARM_PRIORITY_ORDER) {
+      client.subscribe(alertSwitchCommandTopic(p), { qos: 0 }, (err) => {
+        if (err) log(`mqtt-discovery: subscribe ${alertSwitchCommandTopic(p)} failed — ${err.message}`);
+      });
+    }
     publishState();
+    publishSwitchStates();
   });
   client.on('error', (e) => log(`mqtt-discovery: ${e.message}`));
   client.on('reconnect', () => log('mqtt-discovery: reconnecting'));
@@ -435,6 +546,7 @@ export async function startMqttDiscovery(
   return {
     stop: () => {
       if (timer) clearInterval(timer);
+      unsubscribeSettings();
       client.publish(AVAILABILITY_TOPIC, 'offline', { retain: true, qos: 0 });
       client.end(true);
     },

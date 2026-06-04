@@ -38,7 +38,7 @@ test('buildAlertMessage — red with critical alert names category + repeats', (
     packNum: 2,
   }];
   const m = buildAlertMessage('red', alerts);
-  assert.match(m, /Red alert/);
+  assert.match(m, /Critical alarm/); // v0.11.0 — ISA priority prefix (was "Red alert")
   assert.match(m, /Battery system/);
   assert.match(m, /Core three pack two/);
   assert.match(m, /state of health/);
@@ -55,7 +55,7 @@ test('buildAlertMessage — yellow expands MPPT / HV', () => {
     coreNum: 5,
   }];
   const m = buildAlertMessage('yellow', alerts);
-  assert.match(m, /Yellow alert/);
+  assert.match(m, /High priority alarm/); // v0.11.0 — threshold warning → ISA High (was "Yellow alert")
   assert.match(m, /Solar system/);
   assert.match(m, /Core five/);
   assert.match(m, /high voltage/);
@@ -63,9 +63,9 @@ test('buildAlertMessage — yellow expands MPPT / HV', () => {
   assert.doesNotMatch(m, /Repeat/, "warning shouldn't repeat");
 });
 
-test('buildAlertMessage — red without alerts still says red alert', () => {
+test('buildAlertMessage — red without alerts still announces a critical alarm', () => {
   const m = buildAlertMessage('red', []);
-  assert.match(m, /Red alert/);
+  assert.match(m, /Critical alarm/); // v0.11.0 — ISA priority prefix (was "Red alert")
   assert.match(m, /Critical condition/i);
 });
 

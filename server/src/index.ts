@@ -69,6 +69,9 @@ import {
   REFRESH_COOLDOWN_MS,
 } from './ecoflow/commands.js';
 import { appendWriteLog, tailWriteLog } from './writeLog.js';
+// v0.11.0 — ISA-18.2 / IEC 62682 alarm-priority Alert Settings + preview.
+import { getAlertSettings, updateAlertSettings } from './alertSettings.js';
+import { ALARM_PRIORITY_ORDER, ALARM_PRIORITY_META, type AlarmPriority } from './alertPriority.js';
 
 // REST polling cadence. MQTT now delivers per-cmdId fresh data, but we keep a
 // 60s REST poll as a baseline for fields that MQTT doesn't emit and as recovery
@@ -1528,6 +1531,90 @@ app.post<{ Body: { level?: 'red' | 'yellow' | 'green' } }>(
     // v0.9.23 — 429 when blocked by cooldown, 502 on real failures, 200 ok.
     if (!r.ok) {
       const isCooldown = r.cooldownRemainingMs != null && r.cooldownRemainingMs > 0 && r.messages.some((m) => m.startsWith('cooldown:'));
+      reply.code(isCooldown ? 429 : 502);
+    }
+    return r;
+  },
+);
+
+/* ──────────────────────────────────────────────────────────────────────
+ * v0.11.0 — Alert Settings (ISA-18.2 / IEC 62682 alarm-priority annunciation
+ * toggles + chime repeat) and per-priority announcement preview.
+ *
+ * The internal Alert.severity union is unchanged; priority is DERIVED. These
+ * routes expose the user-mutable annunciation layer (alertSettings.ts) and a
+ * preview that renders/plays exactly what each priority sounds like.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/** Serialize the current settings into the cross-group contract shape. */
+function alertSettingsResponse() {
+  const settings = getAlertSettings();
+  return {
+    priorities: ALARM_PRIORITY_ORDER.map((id) => {
+      const m = ALARM_PRIORITY_META[id];
+      return {
+        id: m.id,
+        label: m.label,
+        isa: m.isa,
+        rank: m.rank,
+        tag: m.tag,
+        colorToken: m.colorToken,
+        description: m.description,
+        response: m.response,
+        enabled: settings.priorityEnabled[id] !== false,
+      };
+    }),
+    chimeRepeat: settings.chimeRepeat,
+    updatedAt: settings.updatedAt,
+  };
+}
+
+// GET — current annunciation settings. NO auth: read-only and non-sensitive
+// (matches /api/broadcast/status, which is also unauthenticated).
+app.get('/api/alert-settings', async () => alertSettingsResponse());
+
+// PUT — update per-priority enable flags and/or chime repeat. Write-gated.
+app.put<{ Body: { priorityEnabled?: Partial<Record<AlarmPriority, boolean>>; chimeRepeat?: number } }>(
+  '/api/alert-settings',
+  { preHandler: requireWriteAuth },
+  async (req) => {
+    const body = req.body ?? {};
+    const next = updateAlertSettings(
+      { priorityEnabled: body.priorityEnabled, chimeRepeat: body.chimeRepeat },
+      'web',
+    );
+    appendWriteLog({
+      ts: Date.now(),
+      action: 'alert-settings',
+      sn: '', // not device-specific — settings are global annunciation toggles
+      params: { priorityEnabled: next.priorityEnabled, chimeRepeat: next.chimeRepeat },
+      source: { ip: req.ip, ua: req.headers['user-agent']?.toString() },
+      outcome: 'success',
+    });
+    return alertSettingsResponse();
+  },
+);
+
+// POST — preview a priority's announcement in the browser or on the speakers.
+const PREVIEW_PRIORITIES: AlarmPriority[] = ['critical', 'high', 'medium', 'low'];
+app.post<{ Body: { priority?: AlarmPriority; target?: 'browser' | 'speakers' } }>(
+  '/api/alert-preview',
+  { preHandler: requireWriteAuth },
+  async (req, reply) => {
+    const priority = req.body?.priority;
+    const target = req.body?.target;
+    if (!priority || !PREVIEW_PRIORITIES.includes(priority)) {
+      reply.code(400);
+      return { ok: false, error: 'priority must be one of critical, high, medium, low' };
+    }
+    if (target !== 'browser' && target !== 'speakers') {
+      reply.code(400);
+      return { ok: false, error: "target must be 'browser' or 'speakers'" };
+    }
+    const r = await broadcast.preview(priority, target);
+    // Mirror /api/broadcast/test: 429 on cooldown, 502 on real failure, 200 ok.
+    if (!r.ok) {
+      const isCooldown = r.cooldownRemainingMs != null && r.cooldownRemainingMs > 0;
       reply.code(isCooldown ? 429 : 502);
     }
     return r;

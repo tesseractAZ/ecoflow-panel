@@ -28,7 +28,9 @@
   --color-accent: 14 116 144;    /* #0e7490  instrument cyan */
   --color-ok: 21 128 61;         /* #15803d  status green */
   --color-warn: 180 83 9;        /* #b45309  status amber */
-  --color-bad: 185 28 28;        /* #b91c1c  status red */
+  --color-bad: 185 28 28;        /* #b91c1c  status red (Critical / P1) */
+  --color-high: 234 88 12;       /* #ea580c  orange (High / P2) */
+  --color-info: 37 99 235;       /* #2563eb  blue (Low / P4) */
 
   --font-sans: ui-sans-serif;
   --font-mono: ui-monospace;
@@ -51,7 +53,9 @@
   --color-accent: 255 180 59;    /* #ffb43b  EAS amber */
   --color-ok: 58 255 122;        /* #3aff7a  phosphor green */
   --color-warn: 255 140 31;      /* #ff8c1f  amber alert */
-  --color-bad: 255 40 96;        /* #ff2860  magenta-red */
+  --color-bad: 255 40 96;        /* #ff2860  magenta-red (Critical / P1) */
+  --color-high: 255 122 31;      /* #ff7a1f  hot orange (High / P2) */
+  --color-info: 80 180 255;      /* #50b4ff  station blue (Low / P4) */
 
   --font-sans: 'Orbitron', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'Share Tech Mono', ui-monospace, 'SF Mono', monospace;
@@ -79,7 +83,9 @@
   --color-accent: 255 200 100;   /* #ffc864  amber readout */
   --color-ok: 122 196 96;        /* #7ac460  pale phosphor green */
   --color-warn: 232 156 64;      /* #e89c40  amber/orange alert */
-  --color-bad: 200 64 70;        /* #c84046  red-alert oxblood */
+  --color-bad: 200 64 70;        /* #c84046  red-alert oxblood (Critical / P1) */
+  --color-high: 224 112 58;      /* #e0703a  burnt orange (High / P2) */
+  --color-info: 120 168 220;     /* #78a8dc  calm blue (Low / P4) */
 
   --font-sans: 'Antonio', 'Bahnschrift', 'Eurostile', sans-serif;
   --font-mono: 'Share Tech Mono', ui-monospace, 'SF Mono', monospace;
@@ -119,7 +125,9 @@
   --color-accent: 52 211 153;    /* #34d399  Genesis life-green (emerald 400) */
   --color-ok: 110 231 183;       /* #6ee7b7  emerald 300, less saturated nominal */
   --color-warn: 251 191 36;      /* #fbbf24  amber 400 */
-  --color-bad: 248 113 113;      /* #f87171  coral 400 (only when truly critical) */
+  --color-bad: 248 113 113;      /* #f87171  coral 400 (Critical / P1, only when truly critical) */
+  --color-high: 251 146 60;      /* #fb923c  orange 400 (High / P2) */
+  --color-info: 96 165 250;      /* #60a5fa  blue 400 (Low / P4) */
 
   --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont, ui-sans-serif, 'Inter', 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'SF Mono', ui-monospace, 'Menlo', 'Cascadia Code', monospace;
@@ -162,6 +170,8 @@ body {
 .badge-ok { @apply bg-ok/15 text-ok border-ok/40; }
 .badge-warn { @apply bg-warn/15 text-warn border-warn/40; }
 .badge-bad { @apply bg-bad/15 text-bad border-bad/40; }
+.badge-high { @apply bg-high/15 text-high border-high/40; }   /* v0.11.0 ISA High (P2) */
+.badge-info { @apply bg-info/15 text-info border-info/40; }   /* v0.11.0 ISA Low (P4) */
 .badge-muted { @apply bg-muted/15 text-muted border-muted/40; }
 
 /* Readout bars — recessed track, solid status fill. */

@@ -684,6 +684,61 @@ format.
 - `GET /api/broadcast/tts-services` — what HA's TTS catalog looks like
   from the add-on's perspective
 
+## Alert priority + Alert Settings (v0.11.0)
+
+Every alert carries an internal `severity` (critical / warning / info) and a
+`source` (threshold / learned). On top of those the panel derives a 4-tier
+industrial alarm **priority** following the ISA-18.2 / IEC 62682 alarm-management
+standard. Nothing internal is renamed — priority is a presentation layer — so
+MQTT entity ids and existing HA history are unaffected.
+
+**Priority mapping (severity + source → priority):**
+
+| severity | source | priority | ISA | response |
+| --- | --- | --- | --- | --- |
+| critical | (any) | **Critical** | P1 | Immediate |
+| warning | threshold | **High** | P2 | Prompt |
+| warning | learned | **Medium** | P3 | Investigate |
+| info | (any) | **Low** | P4 | Awareness |
+
+A threshold breach (a protective/hardware limit crossed) is more certain than a
+learned/statistical anomaly, so it ranks higher (High) than a learned warning
+(Medium). A warning with no recorded source collapses to High.
+
+**Alert Settings page.** In the web UI, the **Alert Settings** page lets you:
+
+- **Enable/disable annunciation per priority.** Turning a priority off silences
+  its *annunciation* — push notification + audible broadcast + chime. It does
+  **not** hide the alarm: the condition stays visible in the alert lists with a
+  muted "silenced" marker. (You never make an active alarm invisible; you only
+  change how loudly it announces itself.) The toggles persist to
+  `/data/alert-settings.json` and survive restarts.
+- **Set the chime-repeat count (1–4).** The alert chime now sounds **twice** by
+  default on a new alarm (was once), before the spoken announcement. The repeat
+  count is part of the rendered-audio cache key.
+- **Preview each priority.** A preview button plays exactly what each priority
+  sounds like (chime + spoken voice) without waiting for a real alarm — pick
+  **browser** (plays locally in the page) or **speakers** (broadcasts to the
+  configured `BROADCAST_TARGETS`).
+
+**Home Assistant switches.** Each priority toggle is mirrored via MQTT Discovery
+as a switch entity — `switch.ecoflow_alerts_critical`,
+`switch.ecoflow_alerts_high`, `switch.ecoflow_alerts_medium`,
+`switch.ecoflow_alerts_low`. Flip them from an automation or the HA dashboard;
+state stays in sync with the web page both ways.
+
+**Endpoints:**
+
+- `GET /api/alert-settings` (no auth) — current per-priority enable flags
+  (ordered Critical → Low) + `chimeRepeat`.
+- `PUT /api/alert-settings` (write-auth) — body
+  `{"priorityEnabled": {"critical": false}, "chimeRepeat": 2}`. Partial; unknown
+  keys ignored, `chimeRepeat` clamped to 1–4.
+- `POST /api/alert-preview` (write-auth) — body
+  `{"priority": "high", "target": "browser"}` — renders the representative
+  announcement and returns the spoken text plus an `audio-render/<file>.wav`
+  path the browser plays.
+
 ## Security (v0.9.60)
 
 Write endpoints require auth. Accepted credentials, in order:

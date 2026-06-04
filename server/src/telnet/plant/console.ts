@@ -28,6 +28,9 @@ import {
 } from './data.js';
 import type { PlantData, PlantView } from './types.js';
 import type { AlarmState } from './scada.js';
+// v0.11.0 — the alarm banner is keyed on the 4-tier ISA-18.2 / IEC 62682
+// priority (Critical/High/Medium/Low) instead of the raw severity.
+import { priorityOf, comparePriority, type AlarmPriority } from '../../alertPriority.js';
 
 export function renderConsole(view: PlantView, data: PlantData): string[] {
   const W = view.width;
@@ -60,19 +63,22 @@ export function renderConsole(view: PlantView, data: PlantData): string[] {
   // snapshot. We use snapshot.generatedAt as a proxy "as-of" stamp.
   const stamp = data.snap.generatedAt ?? Date.now();
   const alerts = (data.snap.alerts ?? []).slice();
-  const crit = alerts.filter((a) => a.severity === 'critical');
-  const warn = alerts.filter((a) => a.severity === 'warning');
-  const info = alerts.filter((a) => a.severity === 'info');
-  const newest = crit[0] ?? warn[0] ?? info[0] ?? null;
+  // v0.11.0 — bucket by the 4-tier ISA priority; the highest-priority alarm
+  // (ties broken by list order) is the banner headline.
+  const counts: Record<AlarmPriority, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const a of alerts) counts[priorityOf(a)]++;
+  const newest = alerts
+    .slice()
+    .sort((a, b) => comparePriority(priorityOf(a), priorityOf(b)))[0] ?? null;
   out.push(alarmBanner({
     newest: newest
       ? {
           ts: stamp,
           text: newest.detail ? `${newest.title} — ${newest.detail}` : newest.title,
-          severity: newest.severity as 'critical' | 'warning' | 'info',
+          priority: priorityOf(newest),
         }
       : null,
-    counts: { critical: crit.length, warning: warn.length, info: info.length },
+    counts,
     ackCount: 0,
   }, W));
   out.push('');

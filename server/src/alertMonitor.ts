@@ -24,6 +24,12 @@ import { familyOf } from './alertOutcomes.js';
 import { appendTelemetryEvent, readRecentTelemetry } from './alertTelemetry.js';
 import type { Recorder } from './recorder.js';
 import { getAnalytics } from './analyticsClient.js';
+// v0.11.0 — ISA-18.2 / IEC 62682 annunciation gate. The internal severity
+// union is unchanged; priority is DERIVED from (severity, source). Disabling
+// a priority on the Alert Settings page silences its notification here (the
+// alert stays visible in snapshot.alerts).
+import { isPriorityEnabled } from './alertSettings.js';
+import { priorityOf, priorityMeta } from './alertPriority.js';
 
 /**
  * Watches the fleet, attaches computed alerts to the snapshot, and pushes a
@@ -440,6 +446,11 @@ export function startAlertMonitor(store: SnapshotStore, recorder: Recorder, log:
     const t = telemetry.get(familyOf(alert.id));
     // v0.7.5 silencing or v0.9.3 chronic-noise silencing — skip notify entirely.
     if (t?.downgradedSilenced || t?.chronicNoiseSilenced) return;
+    // v0.11.0 — ISA priority annunciation gate. When the operator has turned
+    // off this alarm's priority on the Alert Settings page, suppress the push
+    // notification (the alert still stays in snapshot.alerts and renders in the
+    // UI — we silence the annunciation, never hide an active alarm).
+    if (!isPriorityEnabled(priorityOf(alert))) return;
     // v0.9.3 warning→info demotion — alert still notifies but at info priority
     // (no [CRITICAL] prefix, lower ntfy priority). The decision applies only
     // to new alerts, not resolved-cleared notifications.
@@ -447,10 +458,17 @@ export function startAlertMonitor(store: SnapshotStore, recorder: Recorder, log:
       t?.warningDemotedToInfo && alert.severity === 'warning' && kind === 'new'
         ? 'info'
         : alert.severity;
+    // v0.11.0 — human-facing title carries the ISA priority LABEL in brackets
+    // for ALL priorities (e.g. "[Critical] …", "[High] …", "[Medium] …",
+    // "[Low] …"), replacing the old critical-only "[CRITICAL] " prefix. This is
+    // purely presentational — the NotifyMessage.severity passed onward below
+    // stays critical/warning/info so the ntfy/Pushover priority maps are
+    // unchanged. Priority is derived from the EFFECTIVE severity (so a
+    // warning→info auto-demotion shows "[Low]").
     const title =
       kind === 'resolved'
         ? `Resolved: ${alert.title}`
-        : `${effectiveSeverity === 'critical' ? '[CRITICAL] ' : ''}${alert.title}`;
+        : `[${priorityMeta(priorityOf({ severity: effectiveSeverity, source: alert.source })).label}] ${alert.title}`;
     try {
       await sendNotification(cfg, {
         title: `EcoFlow · ${title}`,
