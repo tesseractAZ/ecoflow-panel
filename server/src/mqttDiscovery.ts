@@ -320,12 +320,15 @@ export async function startMqttDiscovery(
     const connected = shp2ConnectedDpuSns(snap.devices);
     const gridDpus = dpus.filter((d) => isShp2Connected(d.sn, connected));
 
-    let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0;
+    let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0, fleetBatteryNet = 0;
     for (const d of gridDpus) {
       fleetPv += d.projection.pvTotalWatts ?? 0;
       fleetIn += d.projection.totalInWatts ?? 0;
       fleetOut += d.projection.totalOutWatts ?? 0;
       acIn += d.projection.acInWatts ?? 0;
+      // v0.10.4 — battery net from per-pack flow, not total_in/out throughput
+      // (which = PV+grid in / AC out, overstating battery net ~1.7×).
+      for (const pk of d.projection.packs) fleetBatteryNet += (pk.outputWatts ?? 0) - (pk.inputWatts ?? 0);
     }
     let panelLoad = 0;
     if (shp2) for (const c of shp2.projection.circuits) panelLoad += c.watts ?? 0;
@@ -358,7 +361,7 @@ export async function startMqttDiscovery(
       fleet_pv_watts: Math.round(fleetPv),
       panel_load_watts: Math.round(panelLoad),
       ac_import_watts: Math.round(acIn),
-      fleet_battery_net_watts: Math.round(fleetOut - fleetIn),
+      fleet_battery_net_watts: Math.round(fleetBatteryNet),
       off_grid: acIn < 5,
       backup_pool_percent: shp2?.projection.backupBatPercent ?? null,
       backup_remaining_kwh: kwh1(shp2?.projection.backupRemainWh),

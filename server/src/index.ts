@@ -915,12 +915,17 @@ app.get('/api/ha-state', async (req, reply) => {
   const connected = shp2ConnectedDpuSns(snap.devices);
   const gridDpus = dpus.filter((d) => isShp2Connected(d.sn, connected));
 
-  let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0;
+  let fleetPv = 0, fleetIn = 0, fleetOut = 0, acIn = 0, fleetBatteryNet = 0;
   for (const d of gridDpus) {
     fleetPv += d.projection.pvTotalWatts ?? 0;
     fleetIn += d.projection.totalInWatts ?? 0;
     fleetOut += d.projection.totalOutWatts ?? 0;
     acIn += d.projection.acInWatts ?? 0;
+    // v0.10.4 — battery net from PER-PACK flow, not DPU throughput.
+    // total_in/out = PV+grid in / AC out (throughput), NOT battery flow —
+    // using `totalOut − totalIn` overstated "battery net" ~1.7×. Pack
+    // in = charge, pack out = discharge; net positive = discharging.
+    for (const pk of d.projection.packs) fleetBatteryNet += (pk.outputWatts ?? 0) - (pk.inputWatts ?? 0);
   }
 
   // Panel load = sum of SHP2 circuit watts.
@@ -976,7 +981,7 @@ app.get('/api/ha-state', async (req, reply) => {
     fleet_pv_watts: Math.round(fleetPv),
     fleet_total_in_watts: Math.round(fleetIn),
     fleet_total_out_watts: Math.round(fleetOut),
-    fleet_battery_net_watts: Math.round(fleetOut - fleetIn), // positive = discharging
+    fleet_battery_net_watts: Math.round(fleetBatteryNet), // v0.10.4 per-pack; positive = discharging
     panel_load_watts: Math.round(panelLoad),
     ac_import_watts: Math.round(acIn),
     off_grid: acIn < 5,
@@ -1398,13 +1403,28 @@ app.get('/ws', { websocket: true }, (socket) => {
 const stopPoll = startPollLoop(store, POLL_INTERVAL_MS, (m) => app.log.info(m));
 
 // MQTT is best-effort; if it fails, REST polling still works.
+// v0.10.4 — start with indefinite retry-with-backoff. A transient DNS
+// brownout at boot (the 06-01 EAI_AGAIN event) previously left the add-on
+// PERMANENTLY REST-only — this was a one-shot start with no retry, so a
+// ~1-minute network blip downgraded telemetry resolution ~63% for days,
+// undetected. Now a boot-time blip self-heals: keep retrying (10s → 30s →
+// 60s → 120s → 5min cap) until MQTT connects. (mqtt.ts also retries the
+// cert fetch, so this only fires on a longer outage.)
 let stopMqtt: (() => void) | null = null;
-try {
-  const mqttHandle = await startMqtt(store, (m) => app.log.info(m));
-  stopMqtt = mqttHandle.stop;
-} catch (e: any) {
-  app.log.error(`mqtt: failed to start, falling back to REST polling: ${e?.message ?? e}`);
-}
+const MQTT_RETRY_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
+const startMqttWithRetry = async (attempt = 0): Promise<void> => {
+  if (stopMqtt) return; // already connected (or a prior attempt won the race)
+  try {
+    const mqttHandle = await startMqtt(store, (m) => app.log.info(m));
+    stopMqtt = mqttHandle.stop;
+    if (attempt > 0) app.log.info(`mqtt: connected after ${attempt} retr${attempt === 1 ? 'y' : 'ies'}`);
+  } catch (e: any) {
+    const delay = MQTT_RETRY_MS[Math.min(attempt, MQTT_RETRY_MS.length - 1)];
+    app.log.error(`mqtt: start failed (REST polling continues): ${e?.message ?? e} — retry in ${delay / 1000}s`);
+    setTimeout(() => { void startMqttWithRetry(attempt + 1); }, delay).unref();
+  }
+};
+await startMqttWithRetry();
 
 // Alert monitor: computes fleet alerts, attaches to the snapshot, pushes notifications.
 const monitor = startAlertMonitor(store, recorder, (m) => app.log.info(m));

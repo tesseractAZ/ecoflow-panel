@@ -3,6 +3,75 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.10.4 — 2026-06-04
+
+**7-day real-world audit fixes (P0–P3): MQTT self-heal + data-correctness across the derived energy/forecast/degradation surfaces.**
+
+Driven by a direct read of 7 days of production logs + live engine/history
+endpoints from the Pi. The CORE energy engines validated well (PV within −3%,
+round-trip efficiency ~89.6%), but several *derived* surfaces double-counted
+energy, and the forecast self-evaluation + degradation engines were poisoned by
+cold-start data. None of these changed the raw telemetry — they were all in the
+math layered on top of it.
+
+**P0 — MQTT resilience (the active regression).** A ~1-minute boot-time DNS
+brownout on 06-01 (`EAI_AGAIN api-a.ecoflow.com`) left the add-on **permanently
+REST-only** — MQTT start was a one-shot with no retry, so telemetry resolution
+silently dropped for days. Two layers now self-heal:
+- `ecoflow/mqtt.ts` — the boot certificate HTTPS fetch retries on transient
+  network errors (2s→4s→8s→16s→30s) before giving up.
+- `index.ts` — the MQTT *start* itself now retries with backoff
+  (10s→30s→60s→120s→5min cap) indefinitely, so a boot blip reconnects on its
+  own instead of degrading until the next manual restart.
+
+**P1 — energy double-counting (feeds the HA Energy Dashboard).**
+- **Self-consumption** `solarFractionOfLoadPct` came out an impossible **104.5%**
+  while importing 76 kWh of grid — `(pvToLoad + batteryDischarge)/load` counted
+  PV twice (once at charge, again at discharge). Redefined as grid-displacement
+  `(load − gridImport)/load`, capped at 100% by construction.
+- **Carbon** avoided overstated ~23% for the same reason → now
+  `(load − gridImport) × intensity`, with the battery-served component capped to
+  the remainder so the parts still sum to the honest total.
+- **Tariff** credited the *entire* panel load as "solar value" (incl. grid-served
+  kWh) → now values only `max(0, load − grid)` per hour.
+- **Battery-net power** (`fleet_battery_net_watts`, live in `index.ts` +
+  `mqttDiscovery.ts`, and integrated `batteryNetWh` in `aggregator.ts`) used DPU
+  `total_in/out` (= PV+grid throughput), overstating battery flow ~1.7×. All
+  three now sum **per-pack** in/out (true battery flow).
+- **Lifetime** discharge could exceed lifetime charge (RTE > 100% impossible) →
+  clamped in `recorder.rollupLifetime()`.
+- **Repair feed** no longer raises "zombie offline" cards for the two intentional
+  bench spares (Core 4 / Core 5).
+
+**P2 — forecast self-evaluation.**
+- Forecast-skill bias factor was a phantom **1.47** (true steady-state ≈1.15)
+  because warmup days — where the barely-trained solar model grossly
+  under-predicted — passed the gate. Now a day only feeds the skill/bias stats
+  when the prediction is a non-degenerate fraction of actual (`predKwh ≥ 0.25 ×
+  actKwh`).
+- The 3-day forecast collapsed day-3 to a phantom **0 kWh / 0% SoC** (and bogus
+  "battery dead" panic) because Open-Meteo radiation only reaches ~48h. Added a
+  per-hour-of-day radiation **climatology fallback** so beyond-window hours
+  reflect a typical day.
+
+**P3 — degradation engines (were structurally inert).**
+- **Charge-curve fingerprint** anchored its "fresh" baseline to a fixed
+  200-days-ago window that predated *any* recorded data, so the baseline was
+  always empty and drift never computed. Now anchored to the oldest sample
+  actually recorded, and only diffs once the recent window clears the baseline.
+- **Coulombic efficiency** clamp tightened from `[50, 110]%` to the physical
+  `[90, 100.5]%` — Core 3 was surfacing an impossible 101%+ from a counter quirk.
+- **Internal-resistance** steady-state gate (1 A/s over ±5s) was self-defeating:
+  with sub-second sampling the candidate ≥5A step's own settling busted the
+  bound, yielding **0 samples** (stuck "learning"). Relaxed to 3 A/s over 3s —
+  still rejects 30A motor-inrush, now admits clean isolated steps.
+- **Arrhenius thermal aging** (`avgPackTempC` / `arrheniusFactor`) was computed
+  but dropped *only* in the `learning` return, hiding ~1.7× calendar-fade at
+  ~33°C for every pack without a long SoH trend yet. Now surfaced there too.
+
+342 server tests pass (+1 new IR-relaxation guard, CE clamp test updated to the
+physical band), tsc clean on both packages.
+
 ## 0.10.3 — 2026-05-31
 
 **Housekeeping release — no functional change from v0.10.2.**

@@ -6,6 +6,7 @@ import {
   computeInternalResistance,
   computeChargeCurveFingerprint,
   computeThermalEvents,
+  resetIrCache,
 } from '../src/analytics.js';
 import type { Recorder } from '../src/recorder.js';
 import type { DeviceSnapshot } from '../src/snapshot.js';
@@ -376,6 +377,7 @@ test('kalmanFilterSoh — R = 0.05 keeps the smoothed SoH within ±0.5 of the tr
  * =================================================================== */
 
 test('computeInternalResistance — rejects a 30 A motor-inrush sandwich (v0.9.59 steady-state window)', () => {
+  resetIrCache(); // IR cache isn't fleet-keyed — force a fresh compute for this fixture
   const sn = 'SN-IR-INRUSH';
   const now = Date.now();
   // Build (V,A) pairs around `now - 1 day`. Two quiet 5-s windows with a
@@ -455,26 +457,85 @@ test('coulombic-efficiency clamp — reset-style chg series (last < first) does 
   ];
   const chgDelta = chgPts[chgPts.length - 1].value - chgPts[0].value; // = -195_000
   const dsgDelta = dsgPts[dsgPts.length - 1].value - dsgPts[0].value; // = +15_000
-  // The analysePack guard:
-  //   if (chgDelta >= 10_000 && dsgDelta > 0) { ratio = ... if (50..110) keep }
+  // v0.10.4 — analysePack now clamps to the PHYSICAL band [90, 100.5]:
+  //   if (chgDelta >= 10_000 && dsgDelta > 0) { ratio = ... if (90..100.5) keep }
   // A negative chgDelta fails the first check, so the result is null.
-  let coulombicEffPct: number | null = null;
-  if (chgDelta >= 10_000 && dsgDelta > 0) {
-    const ratio = (dsgDelta / chgDelta) * 100;
-    if (ratio >= 50 && ratio <= 110) coulombicEffPct = ratio;
-  }
+  const clampCE = (chgD: number, dsgD: number): number | null => {
+    if (chgD >= 10_000 && dsgD > 0) {
+      const ratio = (dsgD / chgD) * 100;
+      if (ratio >= 90 && ratio <= 100.5) return ratio;
+    }
+    return null;
+  };
   assert.equal(
-    coulombicEffPct, null,
+    clampCE(chgDelta, dsgDelta), null,
     'reset-style counter (negative chg delta) must produce null, not a wild ratio',
   );
 
-  // Symmetric sanity: a CLEAN, healthy series gives ~99 %.
+  // A CLEAN, healthy series gives ~99 % and is KEPT by the clamp.
   const cleanChg = [{ ts: 0, value: 200_000 }, { ts: 172800_000, value: 250_000 }];
   const cleanDsg = [{ ts: 0, value: 180_000 }, { ts: 172800_000, value: 229_500 }];
-  const cd = cleanChg[1].value - cleanChg[0].value;
-  const dd = cleanDsg[1].value - cleanDsg[0].value;
-  const cleanRatio = (dd / cd) * 100;
+  const cd = cleanChg[1].value - cleanChg[0].value;   // 50_000
+  const dd = cleanDsg[1].value - cleanDsg[0].value;   // 49_500
+  const cleanRatio = (dd / cd) * 100;                 // 99.0
   assert.ok(cleanRatio > 95 && cleanRatio < 100, `expected healthy ~99%, got ${cleanRatio}`);
+  assert.equal(clampCE(cd, dd), cleanRatio, 'a healthy 99% reading is kept by the clamp');
+
+  // v0.10.4 — an IMPOSSIBLE >100% reading (discharge > charge — exactly Core 3's
+  // 101%+ on the Pi) MUST be rejected: you can't extract more than you stored.
+  // The old [50, 110] band let it through and surfaced it as a "tracking" number.
+  assert.equal(clampCE(50_000, 50_500), null, '101% (discharge > charge) is physically impossible → null');
+  // The new floor also drops a counter-artifact 60% (well below LFP reality).
+  assert.equal(clampCE(50_000, 30_000), null, '60% is below the physical floor → null (counter artifact)');
+});
+
+/* ===================================================================
+ * v0.10.4 — internal-resistance steady-state gate RELAXATION.
+ *
+ * The v0.9.59 gate (IR_STEADY_DIDT_MAX_A_PER_S = 1, ±5 s window) was so
+ * tight that the candidate ≥5 A step's OWN settling busted the bound on
+ * both sides, so EVERY valid step was rejected and the engine produced 0
+ * usable samples (stuck "learning" forever in the 7-day Pi audit). v0.10.4
+ * relaxes to 3 A/s over a 3 s window: a clean, isolated step bracketed by
+ * genuinely quiet dwell now produces a tracking R, while the 30 A inrush
+ * sandwich (tested above) is still rejected.
+ * =================================================================== */
+test('computeInternalResistance — clean isolated ≥5 A steps now yield a tracking R (v0.10.4 gate relaxation)', () => {
+  resetIrCache(); // not fleet-keyed — clear the prior test's cached row
+  const sn = 'SN-IR-CLEAN';
+  const now = Date.now();
+  const R_TRUE_MILLI = 10;
+  const vAt = (a: number) => 51.40 - (R_TRUE_MILLI / 1000) * a; // V sags linearly with current
+  const vol: Array<{ ts: number; value: number }> = [];
+  const amp: Array<{ ts: number; value: number }> = [];
+  let ts = now - DAY_MS;
+  let level = 2.0;
+  // 14 dwell-then-step cycles. Each level is held for 5 samples (1 s apart,
+  // ≤0.01 A/s drift — far under the 3 A/s bound), then a single 1 s step of
+  // ~6 A to the other level. Every step is bracketed by ≥3 s of quiet on both
+  // sides, so steadyOn() passes and ΔV/ΔI = 10 mΩ is recorded.
+  for (let cycle = 0; cycle < 14; cycle++) {
+    for (let i = 0; i < 5; i++) {
+      const a = level + 0.01 * i;
+      amp.push({ ts, value: a });
+      vol.push({ ts, value: vAt(a) });
+      ts += 1000;
+    }
+    level = level === 2.0 ? 8.0 : 2.0; // ~6 A step
+    amp.push({ ts, value: level });
+    vol.push({ ts, value: vAt(level) });
+    ts += 1000;
+  }
+
+  const rec = mockRecorder({ [sn]: { bat_vol: vol, bat_amp: amp } });
+  const devices: Record<string, DeviceSnapshot> = { [sn]: buildDpu(sn, [1]) };
+  const report = computeInternalResistance(devices, rec);
+  const row = report.devices[0];
+  assert.equal(row.status, 'tracking', `clean steps should yield tracking; got ${row.status}`);
+  assert.ok(
+    row.recentMilliohms != null && Math.abs(row.recentMilliohms - R_TRUE_MILLI) < 2,
+    `recent R should be ~${R_TRUE_MILLI} mΩ; got ${row.recentMilliohms}`,
+  );
 });
 
 /* ===================================================================

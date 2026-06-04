@@ -243,13 +243,20 @@ export function computeTotals(
       const acOutWh = ingest('ac_out');
       ingest('total_in');
       ingest('total_out');
-      const totalOut = metrics['total_out']?.wh ?? 0;
-      const totalIn = metrics['total_in']?.wh ?? 0;
+      // v0.10.4 — battery net from PER-PACK in/out (true battery flow), not
+      // total_in/out (= DPU throughput = PV+grid in / AC out). The latter
+      // overstated the home battery net ~1.7× on the "Today" card and made it
+      // disagree with the live per-pack sensor. Pack in=charge, out=discharge.
+      let packChargeWh = 0, packDischargeWh = 0;
+      for (const pk of p.packs) {
+        packChargeWh += ingest(`pack${pk.num}_in`);
+        packDischargeWh += ingest(`pack${pk.num}_out`);
+      }
       // Only home-connected DPUs contribute to the fleet rollup.
       if (isShp2Connected(d.sn, connected)) {
         fleet.pvWh += pvWh;
         fleet.acOutWh += acOutWh;
-        fleet.batteryNetWh += totalOut - totalIn;
+        fleet.batteryNetWh += packDischargeWh - packChargeWh;
       }
     } else if (p.kind === 'shp2') {
       fleet.panelLoadWh += ingest('panel_load');

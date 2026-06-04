@@ -1353,9 +1353,13 @@ function analysePack(
     // a single 102.4V string ≈ 10k mAh) — tiny deltas produce noisy ratios.
     if (chgDelta >= 10_000 && dsgDelta > 0) {
       const ratio = (dsgDelta / chgDelta) * 100;
-      // Clamp to a sane band — counter resets or topology quirks otherwise
-      // dump a >120% or negative number into the UI.
-      if (ratio >= 50 && ratio <= 110) coulombicEffPct = round2(ratio);
+      // v0.10.4 — clamp to a PHYSICAL band. Coulombic efficiency cannot exceed
+      // 100% (you can't discharge more than you charged); healthy LFP runs
+      // 99–99.9%. The old 50–110% band let counter quirks surface impossible
+      // values like Core 3's 101%+. 100.5% tolerates counter rounding; a true
+      // <90% would be a hard fault — but it's far more often a counter-reset
+      // artifact, so we drop it rather than alarm on a phantom.
+      if (ratio >= 90 && ratio <= 100.5) coulombicEffPct = round2(ratio);
     }
   }
 
@@ -1369,13 +1373,23 @@ function analysePack(
       r2: fit ? round2(fit.r2) : null,
       dataSpanDays: spanDays,
       samples: sohPts.length,
+      // v0.10.4 — surface thermal state even while "learning". These were
+      // computed (avgPackTempC/arrheniusFactor) but dropped ONLY in this
+      // branch, hiding ~1.7× Arrhenius calendar-aging at ~33 °C for every pack
+      // without a long-enough SoH trend yet (i.e. most of the fleet today).
+      avgPackTempC: avgPackTempC != null ? round1(avgPackTempC) : null,
+      arrheniusFactor: arrheniusFactor != null ? round2(arrheniusFactor) : null,
       coulombicEffPct,
       kalmanSmoothedSoh,
       kalmanFadePctPerYear,
       kalmanFadeStdevPctPerYear,
       kalmanYearsToEol,
       kalmanEolDate,
-      summary: `Gathering data — ${spanDays} day(s) recorded; a dated end-of-life projection needs a longer, cleaner SoH trend (have R² ${fit ? fit.r2.toFixed(2) : '—'}, need ≥ ${EOL_MIN_R2}).`,
+      summary:
+        `Gathering data — ${spanDays} day(s) recorded; a dated end-of-life projection needs a longer, cleaner SoH trend (have R² ${fit ? fit.r2.toFixed(2) : '—'}, need ≥ ${EOL_MIN_R2}).` +
+        (avgPackTempC != null
+          ? ` Avg pack temp ${Math.round(avgPackTempC)} °C${arrheniusFactor != null && arrheniusFactor > 1.1 ? ` — ~${arrheniusFactor.toFixed(1)}× the calendar-fade rate vs a 25 °C reference` : ''}.`
+          : ''),
     });
   }
 
@@ -2467,8 +2481,18 @@ export function computeChargeCurveFingerprint(
       }
       // For each checkpoint, collect baseline (first window) and recent (last 14d) V samples
       // taken DURING ACTIVE CHARGE (inW > 100 to avoid resting voltage).
-      const baselineCutoff = since + CHARGE_BASELINE_WINDOW_MS;
+      // v0.10.4 — anchor the "fresh" baseline to the OLDEST sample actually
+      // recorded, not the fixed 200-days-ago `since`. The DB is only weeks old,
+      // so `since + 14d` landed at ~now−186d — before ANY data existed — and
+      // the baseline came up empty on every run, so drift never computed. The
+      // first 14 days of real data is the correct fresh reference.
+      const firstTs = enriched.length > 0 ? enriched[0].ts : since;
+      const baselineCutoff = firstTs + CHARGE_BASELINE_WINDOW_MS;
       const recentCutoff = now - 14 * 24 * 60 * 60 * 1000;
+      // Drift is only meaningful once the recent window clears the baseline
+      // window. Until ~28 days of span accumulate they overlap, so we hold at
+      // 'baseline' rather than diff overlapping periods (noise read as aging).
+      const windowsSeparated = recentCutoff > baselineCutoff;
       const checkpointResults = CHARGE_CHECKPOINTS.map((target) => {
         const baseline: number[] = [];
         const recent: number[] = [];
@@ -2476,7 +2500,7 @@ export function computeChargeCurveFingerprint(
           if (Math.abs(e.soc - target) > CHARGE_CHECKPOINT_TOLERANCE_PCT) continue;
           if (e.inW < 100) continue;
           if (e.ts <= baselineCutoff) baseline.push(e.vMv);
-          else if (e.ts >= recentCutoff) recent.push(e.vMv);
+          else if (windowsSeparated && e.ts >= recentCutoff) recent.push(e.vMv);
         }
         const baselineV = baseline.length >= 3 ? median(baseline) : null;
         const recentV = recent.length >= 3 ? median(recent) : null;
@@ -2543,8 +2567,15 @@ const IR_DELTA_T_MAX_MS = 60_000;
 // reject the pair as transient. This filters out the very class of step
 // events that contaminate the trend most badly (a 30-day median is robust
 // against a single outlier but a single noisy day still walks the line).
-const IR_STEADY_WINDOW_MS = 5_000;
-const IR_STEADY_DIDT_MAX_A_PER_S = 1;
+// v0.10.4 — the original 1 A/s bound was self-defeating: with sub-second DPU
+// sampling, the candidate ≥5 A step's OWN settling ramps the surrounding ±5 s
+// windows well past 1 A/s, so essentially every valid step was rejected and
+// the engine produced 0 samples (stuck "learning" indefinitely). 3 A/s still
+// rejects the violent transients we care about (inverter load-steps and motor
+// inrush run 10+ A/s) while admitting normal post-step settling; the 3 s
+// window narrows the neighborhood we require to be quiet.
+const IR_STEADY_WINDOW_MS = 3_000;
+const IR_STEADY_DIDT_MAX_A_PER_S = 3;
 // Tightened sanity band: > 100 mΩ is a failed pack (not a measurement worth
 // median-aging into the trend); < 2 mΩ is below the resolution of the
 // inverter-bus dV/dI signal. Was [1, 500] mΩ — let through bus-noise.
@@ -2766,7 +2797,12 @@ export async function computeForecastSkill(
       errorKwh: round2(errKwh),
       errorPct: errPct,
     });
-    if (predKwh > 0.5 && actKwh > 0.5) {
+    // v0.10.4 — only "mature" days feed the skill stats. Warmup days, where
+    // the solar model was barely trained and under-predicted grossly (predKwh
+    // a small fraction of actual), passed the old `>0.5` gate and dragged
+    // biasFactor to a phantom 1.47 (steady-state ≈1.15) — and inflated MAE.
+    // Require the prediction to be a non-degenerate fraction of actual.
+    if (predKwh > 0.5 && actKwh > 0.5 && predKwh >= 0.25 * actKwh) {
       totalPred += predKwh; totalAct += actKwh;
       errSum += Math.abs(errKwh); errCount++;
     }
@@ -3175,7 +3211,6 @@ export function computeSelfConsumption(
   // came from grid. On an off-grid system gridImportKwh ≈ 0 and PV ≈ load+charge.
   const pvToBatteryKwh = Math.max(0, batteryChargeKwh - gridImportKwh);
   const pvToLoadKwh = Math.max(0, pvKwh - pvToBatteryKwh);
-  const solarToLoadKwh = pvToLoadKwh + batteryDischargeKwh;
   const value: SelfConsumption = {
     generatedAt: now,
     windowDays,
@@ -3186,7 +3221,12 @@ export function computeSelfConsumption(
     gridImportKwh: round2(gridImportKwh),
     pvToLoadKwh: round2(pvToLoadKwh),
     pvToBatteryKwh: round2(pvToBatteryKwh),
-    solarFractionOfLoadPct: loadKwh > 0.5 ? Math.round((solarToLoadKwh / loadKwh) * 1000) / 10 : null,
+    // v0.10.4 — solar fraction = share of load NOT met by grid import.
+    // Prior `(pvToLoad + batteryDischarge)/load` double-counted PV that
+    // transited the battery (counted at charge AND again at discharge),
+    // yielding an impossible 104.5% while importing 76 kWh of grid. The
+    // grid-displacement form caps at 100% by construction.
+    solarFractionOfLoadPct: loadKwh > 0.5 ? Math.max(0, Math.round(((loadKwh - gridImportKwh) / loadKwh) * 1000) / 10) : null,
     directUseRatioPct: pvKwh > 0.5 ? Math.round((pvToLoadKwh / pvKwh) * 1000) / 10 : null,
   };
   if (dpus.length > 0) selfConsumptionCache = { ts: now, key, value };
@@ -4341,9 +4381,14 @@ export function computeCarbonReport(
     (lifetimeTotals['fleet_pv_wh']?.pendingWh ?? 0);
   const pvLifetimeKwh = pvLifetimeWh / 1000;
 
-  const pvToLoadKg = sc.pvToLoadKwh * intensity;
-  const batteryDischargeKg = sc.batteryDischargeKwh * intensity;
-  const totalKg = pvToLoadKg + batteryDischargeKg;
+  // v0.10.4 — CO2 avoided = the grid you DIDN'T pull = (load − gridImport).
+  // Prior `pvToLoad + batteryDischarge` double-counted PV that cycled through
+  // the battery (~23% overstatement / ~50 kg). Cap the battery-served
+  // component to the remainder so the parts still sum to the honest total.
+  const gridDisplacedKwh = Math.max(0, sc.loadKwh - sc.gridImportKwh);
+  const totalKg = gridDisplacedKwh * intensity;
+  const pvToLoadKg = Math.min(sc.pvToLoadKwh * intensity, totalKg);
+  const batteryDischargeKg = Math.max(0, totalKg - pvToLoadKg);
   const lifetimeKg = pvLifetimeKwh * intensity; // lifetime PV ≈ grid kWh avoided
 
   const value: CarbonReport = {
@@ -4480,7 +4525,10 @@ export function computeTariffReport(
         loadWh += integrateWh(loadSeries, t, tEnd).wh;
       }
       gridCost += (gridWh / 1000) * rate;
-      loadValue += (loadWh / 1000) * rate;
+      // v0.10.4 — value only the solar+battery-served load (subtract grid),
+      // not the entire panel_load. Prior code credited grid-served kWh as
+      // "solar value", inflating net savings ~$13 over the window.
+      loadValue += (Math.max(0, loadWh - gridWh) / 1000) * rate;
     }
     return { gridCost, loadValue };
   };
@@ -4829,6 +4877,23 @@ export async function computeMultiDayForecast(
   }
   const fallbackLoad = forecast.hours[0]?.forecastLoadW ?? 0;
 
+  // v0.10.4 — radiation climatology for hours BEYOND the weather window.
+  // Open-Meteo's hourly radiation typically reaches only ~48 h out, so day-3
+  // hours had no `wx` entry → pv computed as 0 → a phantom PV-blackout that
+  // drained projected SoC to a false 0% and fired bogus "battery dead in 3
+  // days" panic. Build a per-hour-of-day mean radiation from the hours we DO
+  // have and reuse it past the window so day-3 reflects a typical day.
+  const radClimoSum = new Array(24).fill(0);
+  const radClimoCount = new Array(24).fill(0);
+  for (const wh of weather.hours) {
+    if (wh.radiationWm2 > 0) {
+      const hod = new Date(wh.ts).getHours();
+      radClimoSum[hod] += wh.radiationWm2;
+      radClimoCount[hod]++;
+    }
+  }
+  const climoRadiationWm2 = (hod: number) => (radClimoCount[hod] > 0 ? radClimoSum[hod] / radClimoCount[hod] : 0);
+
   const days: DayRollup[] = [];
   const todayStart = startOfLocalDayMs();
   for (let dayIdx = 0; dayIdx < horizonDays; dayIdx++) {
@@ -4843,9 +4908,12 @@ export async function computeMultiDayForecast(
       const wx = wxByHour.get(Math.floor(t / 3_600_000));
       const hod = new Date(t).getHours();
       const resp = forecast.solarModel.hourly[hod];
+      // v0.10.4 — real weather where available, else the radiation climatology
+      // (see above) so day-3 doesn't collapse to a phantom 0 kWh / 0% SoC.
+      const radiationWm2 = wx ? wx.radiationWm2 : climoRadiationWm2(hod);
       let pv = 0;
-      if (resp.coeff != null && wx) {
-        pv = Math.min(resp.coeff * wx.radiationWm2, resp.observedMaxPvW * 1.05);
+      if (resp.coeff != null && radiationWm2 > 0) {
+        pv = Math.min(resp.coeff * radiationWm2, resp.observedMaxPvW * 1.05);
       }
       // v0.9.58 — per-HoD load (see loadByHod above), not constant-from-hour-0.
       const load = loadHodFilled[hod] ? loadByHod[hod] : fallbackLoad;
@@ -5604,6 +5672,10 @@ export function resetHaStateShortLivedCaches(): void {
 export function resetClippingCache(): void { clippingCache = null; }
 export function resetRteCache(): void { rteCache = null; }
 export function resetTariffCache(): void { tariffCache = null; }
+// v0.10.4 — IR cache is a single module global NOT keyed by the device fleet
+// (fine in prod where the fleet is constant, but tests with distinct fixtures
+// inherit the prior run's row). Exported so a test can force a fresh compute.
+export function resetIrCache(): void { irCache = null; }
 /** Carbon recomputes self-consumption internally; null both so carbon
  *  re-pulls the freshly-warmed self-consumption rather than a stale one. */
 export function resetSelfConsumptionCache(): void {

@@ -2,7 +2,7 @@ import mqtt, { MqttClient } from 'mqtt';
 import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { ecoflow } from './rest.js';
+import { ecoflow, type MqttCertification } from './rest.js'; // v0.10.4 — type for cert retry helper
 import { SnapshotStore } from '../snapshot.js';
 import { config } from '../config.js';
 import { translateDpuMqtt } from './mqttTranslate.js';
@@ -46,9 +46,40 @@ export interface MqttHandle {
   client: MqttClient;
 }
 
+// v0.10.4 — retry the cert HTTPS fetch on transient network errors so a boot-time
+// DNS brownout (EAI_AGAIN/ENOTFOUND/ECONNREFUSED/ETIMEDOUT/timeout) no longer aborts
+// MQTT start before the mqtt client (with its built-in reconnectPeriod) is created.
+function isTransientNetworkError(e: any): boolean {
+  const code = String(e?.code ?? '');
+  const msg = String(e?.message ?? e ?? '').toLowerCase();
+  return (
+    /EAI_AGAIN|ENOTFOUND|ECONNREFUSED|ETIMEDOUT/i.test(code) ||
+    /eai_again|enotfound|econnrefused|etimedout|timeout|connect timeout|fetch failed|network/i.test(msg)
+  );
+}
+
+async function getMqttCertificationWithRetry(log: (msg: string) => void): Promise<MqttCertification> {
+  // Backoff schedule: 2s, 4s, 8s, 16s, 30s (capped at 30s); throw only after the last attempt.
+  const backoffMs = [2000, 4000, 8000, 16000, 30000];
+  const attempts = backoffMs.length;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await ecoflow.getMqttCertification();
+    } catch (e: any) {
+      const last = i === attempts - 1;
+      if (last || !isTransientNetworkError(e)) throw e;
+      const wait = backoffMs[i];
+      log(`mqtt: certification fetch failed (${e.message}); retry ${i + 1}/${attempts - 1} in ${wait / 1000}s`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  // Unreachable: the loop either returns or throws above.
+  throw new Error('mqtt: certification retry exhausted');
+}
+
 export async function startMqtt(store: SnapshotStore, log: (msg: string) => void): Promise<MqttHandle> {
   log('mqtt: requesting certification');
-  const cert = await ecoflow.getMqttCertification();
+  const cert = await getMqttCertificationWithRetry(log);
   const username = cert.certificateAccount;
   const password = cert.certificatePassword;
   // Stable client_id derived from access key — same Mac, same id every restart.

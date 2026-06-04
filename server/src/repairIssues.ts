@@ -40,6 +40,12 @@ export interface RepairIssuesReport {
 // fetches. Reset only when the issue clears.
 const firstSeenById = new Map<string, number>();
 
+// v0.10.4 — known OFFLINE BENCH SPARES (Core4, Core5) are intentionally kept
+// powered down, so their EcoFlow-offline state is expected — not actionable.
+// Suppress zombie-offline repair cards for these SNs to stop false-positive
+// "power-cycle / reseat Ethernet" warnings.
+const EXCLUDED_SPARE_SNS = new Set(['Y711ZABA9H3T0489', 'Y711ZAB59G9P0090']);
+
 function track(id: string, now: number): number {
   let ts = firstSeenById.get(id);
   if (ts == null) {
@@ -65,6 +71,8 @@ export function computeRepairIssues(ctx: RepairContext): RepairIssuesReport {
   // EcoFlow-zombie devices (cloud says offline) — actionable as power-cycle.
   for (const d of Object.values(ctx.devices)) {
     if (!d.online) {
+      // v0.10.4 — skip intentionally-offline bench spares (Core4, Core5).
+      if (EXCLUDED_SPARE_SNS.has(d.sn)) continue;
       const id = `zombie-${d.sn}`;
       out.push({
         id,

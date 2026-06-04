@@ -546,8 +546,22 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
     const bms = computeBmsBatteryTotals(snap);
     if (bms.chargeWh > bmsChargeFloor) bmsChargeFloor = bms.chargeWh;
     if (bms.dischargeWh > bmsDischargeFloor) bmsDischargeFloor = bms.dischargeWh;
-    writeLifetime('fleet_battery_charge_wh', bmsChargeFloor, now);
-    writeLifetime('fleet_battery_discharge_wh', bmsDischargeFloor, now);
+    // v0.10.4 — enforce the physical invariant lifetime discharge ≤ lifetime
+    // charge before surfacing. The monotone floor-seeding can let discharge
+    // advance while charge stays pinned across reboots, producing an
+    // impossible RTE > 100% (e.g. 8027 Wh out vs 7980 Wh in). A battery can
+    // never deliver more than it stored, so clamp the surfaced discharge to
+    // the charge value. Floors stay intact (monotonicity preserved); we only
+    // clamp the written-out number and WARN so the data-quality issue stays
+    // visible without HA's Energy tiles contradicting themselves.
+    let chargeOut = bmsChargeFloor;
+    let dischargeOut = bmsDischargeFloor;
+    if (dischargeOut > chargeOut) {
+      log(`recorder: WARN clamping lifetime battery discharge ${dischargeOut.toFixed(0)} Wh to charge ${chargeOut.toFixed(0)} Wh (RTE > 100% is impossible; raw floors charge=${bmsChargeFloor.toFixed(0)} discharge=${bmsDischargeFloor.toFixed(0)})`);
+      dischargeOut = chargeOut;
+    }
+    writeLifetime('fleet_battery_charge_wh', chargeOut, now);
+    writeLifetime('fleet_battery_discharge_wh', dischargeOut, now);
   };
 
   // Roll up every 5 min — fast enough that HA sees fresh totals each poll,
