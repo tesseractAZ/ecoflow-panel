@@ -1,26 +1,34 @@
 /**
- * Minimal service worker for EcoFlow Panel PWA.
+ * Service worker for the EcoFlow Panel PWA.
  *
  * Strategy:
- *   - Static assets (HTML, JS, CSS, images): stale-while-revalidate.
- *   - API requests (/api/* anywhere in the path, /ws): NEVER cached.
+ *   - API requests (`/api/*` anywhere in the path, `/ws`): NEVER cached.
+ *   - The HTML document (navigation requests): NETWORK-FIRST. index.html is the
+ *     only file that names the content-hashed JS/CSS bundles. If a stale copy
+ *     is ever served it points at hashes the server deleted on the next build,
+ *     and the page white-screens. So we always fetch the document fresh and
+ *     fall back to cache only when offline.
+ *   - Content-hashed static assets (JS/CSS/img/fonts): stale-while-revalidate.
+ *     These are immutable — a given URL never changes content — so caching is
+ *     safe and fast.
  *
- * v0.9.5 — the API-detection regex now matches `/api/` anywhere in the
- * pathname (not just the start) so live data bypasses cache both on
- * direct LAN (:8787/api/...) and under HA Ingress
- * (/api/hassio_ingress/<token>/api/...). Without this, requests through
- * Ingress would be served from cache instead of hitting the live add-on.
+ * v0.11.2 — fixes a Safari (and any-browser) white-screen after a redeploy:
+ *   the previous version used stale-while-revalidate for the *document* too,
+ *   so a cached old index.html survived a new build and referenced now-404
+ *   bundles. Switched the document to network-first and bumped the cache name
+ *   (below) so `activate` purges the stale cache wholesale.
+ *
+ * v0.9.5 — the API-detection regex matches `/api/` anywhere in the pathname so
+ *   live data bypasses cache both on direct LAN (:8787/api/...) and under HA
+ *   Ingress (/api/hassio_ingress/<token>/api/...).
  */
-const CACHE = 'ecoflow-panel-v0.9.5';
-// No pre-cached static assets — let the SW lazily cache whatever the page
-// actually fetches. Avoids `caches.addAll` failing when running under a
-// subpath (the absolute '/' wouldn't match the ingress mount point).
-const STATIC_ASSETS = [];
+// Bump this string on any caching-behaviour change so `activate` deletes the
+// previous cache (which may hold a poisoned, stale index.html).
+const CACHE = 'ecoflow-panel-v0.11.2';
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(STATIC_ASSETS)).then(() => self.skipWaiting()),
-  );
+  // Take over as soon as installed — don't wait for all tabs to close.
+  event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener('activate', (event) => {
@@ -33,19 +41,40 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-  // Live data — bypass cache entirely. Match `/api/...` anywhere in the
-  // path AND any URL ending in `/ws` (websocket upgrade). Catches both
-  // direct LAN (/api/snapshot, /ws) and Ingress
-  // (/api/hassio_ingress/<token>/api/snapshot, .../ws).
+  const req = event.request;
+  const url = new URL(req.url);
+
+  // Live data — bypass the SW entirely (direct LAN + Ingress, plus the WS).
   if (/\/api\//.test(url.pathname) || /\/ws$/.test(url.pathname)) return;
-  // Static — stale-while-revalidate.
+  // Only GETs are cacheable; writes (POST/PUT) must always hit the network.
+  if (req.method !== 'GET') return;
+
+  // The HTML document → network-first. Always get a fresh index.html so it
+  // references the current asset hashes; fall back to the cached copy only
+  // when the network is unreachable.
+  const isDocument = req.mode === 'navigate' || req.destination === 'document';
+  if (isDocument) {
+    event.respondWith(
+      fetch(req)
+        .then((response) => {
+          if (response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return response;
+        })
+        .catch(() => caches.open(CACHE).then((c) => c.match(req))),
+    );
+    return;
+  }
+
+  // Content-hashed static assets → stale-while-revalidate.
   event.respondWith(
     caches.open(CACHE).then((cache) =>
-      cache.match(event.request).then((cached) => {
-        const network = fetch(event.request)
+      cache.match(req).then((cached) => {
+        const network = fetch(req)
           .then((response) => {
-            if (response.ok) cache.put(event.request, response.clone());
+            if (response.ok) cache.put(req, response.clone());
             return response;
           })
           .catch(() => cached);

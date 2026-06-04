@@ -3,6 +3,22 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.11.2 — 2026-06-04
+
+**Fix: blank dashboard in Safari (and any browser) after a redeploy — a stale service-worker cache.**
+
+The PWA service worker used stale-while-revalidate for the HTML *document*, so
+after a new build it could keep serving a cached old `index.html` that
+references content-hashed JS/CSS bundles the server has since deleted → the
+scripts 404 → white screen. Safari is especially prone to this. Fixed: the
+document is now fetched **network-first** (always current asset hashes; cache is
+the offline fallback only), while the immutable hashed assets keep
+stale-while-revalidate. The cache name is bumped to `ecoflow-panel-v0.11.2`, and
+`install`/`activate` call `skipWaiting()` + `clients.claim()` and purge the old
+cache, so the new worker takes over and self-heals on the next load. No app
+behaviour change. (If a browser is currently stuck blank, one hard reload — or
+clearing the site's website data once — picks up the new worker.)
+
 ## 0.11.1 — 2026-06-04
 
 **Polish: clean entity_ids + friendly names for the alarm-priority HA switches.**
