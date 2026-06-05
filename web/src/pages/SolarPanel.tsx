@@ -200,7 +200,9 @@ export function SolarPanel({ devices }: { devices: Record<string, DeviceSnapshot
           <span className="text-xs text-muted normal-case tracking-normal">1-min buckets</span>
         </div>
         <div style={{ width: '100%', height: 280 }}>
-          <ResponsiveContainer width="100%" height="100%">
+          {/* v0.12.0 — minWidth={0}/minHeight silence recharts' 0-size warning
+              when the parent measures 0 at mount; fixed px height unchanged. */}
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={280}>
             <AreaChart data={mergedSeries} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
               <defs>
                 {onlineDpus.map((d, i) => (

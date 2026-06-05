@@ -1,5 +1,6 @@
 import type { DeviceSnapshot } from './snapshot.js';
 import type { DpuProjection, Shp2Projection } from './ecoflow/project.js';
+import { activeSocBand, socAlertSeverity } from './batterySocAlarm.js';
 
 /**
  * System-wide alerts engine — the single source of truth. The web UI renders
@@ -360,6 +361,31 @@ export function computeAlerts(
         out.push({ id: `circuit-overload-${pc.primaryCh}`, severity: 'warning', category: 'SHP2', device: shp2.deviceName, title: 'Circuit near breaker limit', detail: `${pc.name} drawing ${Math.round(pc.watts)} W — over ${Math.round(CIRCUIT_BREAKER_WARN_FRAC * 100)}% of its ${pc.breakerAmps} A breaker.` });
       }
     }
+  }
+
+  // v0.12.0 — backup-pool SoC band alert. One on-screen alert for the lowest
+  // SoC threshold the backup pool is currently at/below (40/30/20/15/10/8/4/2 %),
+  // its severity/source chosen by socAlertSeverity so priorityOf() derives the
+  // matching ISA tier (Low→Critical). The audible escalating alarm is fired
+  // separately via broadcast.announce (batterySocAlarm + index.ts); the id MUST
+  // start with 'backup-soc' so broadcast.ts excludes it from its own chime and
+  // the dedicated announce stays the sole SoC audible.
+  const socShp2 = list.find((d) => d.projection?.kind === 'shp2') as
+    | (DeviceSnapshot & { projection: Shp2Projection })
+    | undefined;
+  const soc = socShp2?.projection.backupBatPercent ?? null;
+  const band = activeSocBand(soc);
+  if (band !== null && soc != null) {
+    const { severity, source } = socAlertSeverity(band.priority);
+    out.push({
+      id: `backup-soc-${band.pct}`,
+      severity,
+      source,
+      category: 'Battery',
+      device: 'SHP2 backup pool',
+      title: `Backup pool low — ${Math.round(soc)}%`,
+      detail: `Backup reserve at ${Math.round(soc)}%, at or below the ${band.pct}% ${band.priority}-priority threshold.`,
+    });
   }
 
   return out.sort((a, b) => order[a.severity] - order[b.severity] || a.category.localeCompare(b.category));

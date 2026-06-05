@@ -49,7 +49,10 @@ export function Sparkline({ sn, metric, windowMs = 60 * 60 * 1000, refreshMs = 3
   }
   return (
     <div style={{ height, width: '100%' }}>
-      <ResponsiveContainer width="100%" height="100%">
+      {/* v0.12.0 — wrapper height is already pinned; minWidth={0}/minHeight
+          additionally silence recharts' 0-size warning when a sparkline mounts
+          in a narrow cell whose width hasn't laid out yet. Height unchanged. */}
+      <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={height}>
         <LineChart data={points} margin={{ top: 2, bottom: 2, left: 0, right: 0 }}>
           <YAxis hide domain={[minY ?? 'dataMin', maxY ?? 'dataMax']} />
           <Line type="monotone" dataKey="value" stroke={color} strokeWidth={1.5} dot={false} isAnimationActive={false} />

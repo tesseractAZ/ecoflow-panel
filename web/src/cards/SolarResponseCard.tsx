@@ -140,7 +140,10 @@ export function SolarResponseCard() {
           </div>
 
           <div style={{ width: '100%', height: 260 }}>
-            <ResponsiveContainer width="100%" height="100%">
+            {/* v0.12.0 — minWidth={0}/minHeight stop recharts' "width(-1) and
+                height(-1)…" console warning when the parent box measures 0 on
+                the first layout pass; the wrapper's fixed px height is unchanged. */}
+            <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260}>
               <LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#c4cad3" strokeDasharray="3 3" />
                 <XAxis dataKey="label" tick={{ fill: '#586474', fontSize: 10 }} />

@@ -139,7 +139,10 @@ export function CircuitModal({
 
         <div className="text-xs uppercase tracking-widest text-muted mb-1.5">Last 24 hours</div>
         <div style={{ width: '100%', height: 240 }}>
-          <ResponsiveContainer width="100%" height="100%">
+          {/* v0.12.0 — minWidth={0}/minHeight stop recharts' "width(-1) and
+              height(-1)…" warning: a modal mounts inside a flex-centered
+              overlay, so the box can measure 0 on the first layout pass. */}
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={240}>
             <AreaChart data={points} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="gradCircuit" x1="0" y1="0" x2="0" y2="1">
@@ -195,7 +198,8 @@ function HistorySection({ history }: { history: CircuitHistory | null }) {
         <span className="text-[10px] text-muted">today is partial; bars are daily kWh totals</span>
       </div>
       <div style={{ width: '100%', height: 180 }}>
-        <ResponsiveContainer width="100%" height="100%">
+        {/* v0.12.0 — minWidth={0}/minHeight: same modal 0-size guard as above. */}
+        <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={180}>
           <BarChart data={history.days} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
             <CartesianGrid stroke="#c4cad3" strokeDasharray="3 3" vertical={false} />
             <XAxis

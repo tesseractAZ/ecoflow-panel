@@ -739,6 +739,38 @@ state stays in sync with the web page both ways.
   announcement and returns the spoken text plus an `audio-render/<file>.wav`
   path the browser plays.
 
+## Backup-pool SoC alarm (v0.12.0)
+
+An **audible, escalating-priority alarm** fires each time the SHP2 backup
+pool's state-of-charge (SoC) crosses **down** through a threshold. It chimes +
+speaks on the **broadcast speakers** (the same HomePod / Sonos / Cast path as
+the rest of the broadcast subsystem) and raises a matching on-screen
+**"Backup pool low"** alert at the same priority. The priority **escalates** as
+the reserve gets lower:
+
+| SoC crossed (downward) | Priority | ISA |
+| --- | --- | --- |
+| 40 %, 30 % | **Low** | P4 |
+| 20 %, 15 % | **Medium** | P3 |
+| 10 %, 8 % | **High** | P2 |
+| 4 %, 2 % | **Critical** | P1 |
+
+The announcement is **edge-triggered** — it fires once per downward crossing,
+not once per poll — with hysteresis so a value hovering on a boundary doesn't
+chatter, and **persisted state** (in `/data`) with boot-arming so a restart
+while the reserve is already low doesn't re-announce thresholds it already
+crossed.
+
+It respects the **Alert Settings** per-priority annunciation toggles (and the
+mirrored `switch.ecoflow_alerts_*` entities): silence a priority and its SoC
+crossings go quiet, exactly like every other annunciation. The on-screen alert
+(id `backup-soc-<pct>`, e.g. `backup-soc-20`) is deliberately excluded from the
+normal alert→broadcast path so it never double-chimes — the dedicated
+announcement is the sole SoC audible.
+
+Set the add-on option **`BATTERY_SOC_ALARM_ENABLED`** to `false` to disable the
+feature entirely (default: enabled).
+
 ## Security (v0.9.60)
 
 Write endpoints require auth. Accepted credentials, in order:

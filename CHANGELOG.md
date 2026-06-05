@@ -3,6 +3,47 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.12.0 — 2026-06-04
+
+**New: an AUDIBLE, escalating-priority alarm when the SHP2 backup pool runs down — plus a recharts console-warning fix.**
+
+The backup-pool reserve now announces itself **out loud on your HA speakers**
+each time its state-of-charge (SoC) crosses **down** through one of eight
+thresholds — **40 / 30 / 20 / 15 / 10 / 8 / 4 / 2 %** — with the alarm
+**priority escalating** as the reserve drops:
+
+| SoC crossed (down) | Priority | Klaxon |
+| --- | --- | --- |
+| 40 %, 30 % | **Low** (P4) | soft |
+| 20 %, 15 % | **Medium** (P3) | — |
+| 10 %, 8 % | **High** (P2) | — |
+| 4 %, 2 % | **Critical** (P1) | urgent |
+
+Each crossing fires an escalating chime (`klaxonLevelForPriority`) followed by a
+spoken announcement (e.g. *"Backup pool at 20 percent. Medium priority alarm."*)
+over the configured `BROADCAST_TARGETS`, via the same broadcast path as the rest
+of the audible subsystem. Details:
+
+- **Edge-triggered — one announcement per downward crossing**, not once per
+  poll. Hysteresis (re-arm only after SoC climbs a couple points back above a
+  threshold) stops a value sitting on a boundary from chattering.
+- **Persisted state** (in `/data`) with boot-arming, so a restart while the
+  reserve is already low does **not** re-announce thresholds it already crossed.
+- **Gated by the per-priority Alert Settings toggles** — silencing e.g. *Low*
+  in Alert Settings (or via `switch.ecoflow_alerts_low`) mutes its 40 %/30 %
+  announcements, exactly like every other annunciation.
+- A matching on-screen **"Backup pool low"** alert (id `backup-soc-<pct>`)
+  appears at the **same** ISA priority. It's deliberately excluded from the
+  normal alert→broadcast path so it never double-chimes — the dedicated
+  announcement is the sole SoC audible.
+- New add-on option **`BATTERY_SOC_ALARM_ENABLED`** (default `true`) to disable
+  the whole thing.
+
+Also fixed a recharts `ResponsiveContainer` *"The width(-1) and height(-1) of
+chart should be greater than 0"* console warning, caused by a chart rendered
+into a momentarily 0-height container. Cosmetic only — the charts themselves
+were unaffected.
+
 ## 0.11.3 — 2026-06-04
 
 **Fix: blank dashboard on the Opus theme (a stale `speakerGroups` read) + a top-level error boundary.**

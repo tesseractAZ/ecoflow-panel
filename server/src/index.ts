@@ -10,7 +10,7 @@ import { dirname, resolve } from 'node:path';
 import { config } from './config.js';
 import { createAuth } from './auth.js';
 import { SnapshotStore, startPollLoop } from './snapshot.js';
-import type { DeviceSnapshot } from './snapshot.js';
+import type { DeviceSnapshot, FleetSnapshot } from './snapshot.js';
 import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
 import { startMqtt } from './ecoflow/mqtt.js';
 import { createRecorder } from './recorder.js';
@@ -70,8 +70,10 @@ import {
 } from './ecoflow/commands.js';
 import { appendWriteLog, tailWriteLog } from './writeLog.js';
 // v0.11.0 — ISA-18.2 / IEC 62682 alarm-priority Alert Settings + preview.
-import { getAlertSettings, updateAlertSettings } from './alertSettings.js';
+import { getAlertSettings, updateAlertSettings, isPriorityEnabled } from './alertSettings.js';
 import { ALARM_PRIORITY_ORDER, ALARM_PRIORITY_META, type AlarmPriority } from './alertPriority.js';
+// v0.12.0 — backup-pool SoC audible alarm (escalating priority).
+import { createBatterySocAlarm, socAlarmMessage } from './batterySocAlarm.js';
 
 // REST polling cadence. MQTT now delivers per-cmdId fresh data, but we keep a
 // 60s REST poll as a baseline for fields that MQTT doesn't emit and as recovery
@@ -1480,6 +1482,22 @@ const broadcast = startBroadcastMonitor(store, (m) => app.log.info(m), {
   klaxonDir: audioDir,
   cacheDir: audioRenderDir,
   cacheUrlPath: '/audio-render',
+});
+
+// v0.12.0 — backup-pool SoC audible alarm (40/30/20/15/10/8/4/2%, escalating priority).
+const socAlarmEnabled = process.env.BATTERY_SOC_ALARM_ENABLED !== 'false';
+const batterySocAlarm = createBatterySocAlarm({
+  onCross: (t) => {
+    if (!isPriorityEnabled(t.priority)) return;        // honour the Alert Settings annunciation toggles
+    void broadcast.announce(t.priority, socAlarmMessage(t));
+  },
+  log: (m) => app.log.info(m),
+});
+store.on('change', (snap: FleetSnapshot) => {
+  if (!socAlarmEnabled) return;
+  const shp2 = Object.values(snap.devices).find((d) => d.projection?.kind === 'shp2');
+  const soc = shp2 && shp2.projection?.kind === 'shp2' ? shp2.projection.backupBatPercent : null;
+  batterySocAlarm.update(soc);
 });
 
 // Diagnostics: the analytics worker is the cache warmer now (self-warming

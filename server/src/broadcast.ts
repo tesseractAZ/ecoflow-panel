@@ -137,8 +137,13 @@ function clamp01(n: number): number {
 export type ConditionLevel = 'green' | 'yellow' | 'red';
 
 export function conditionFromAlerts(alerts: Alert[]): { level: ConditionLevel; crit: number; warn: number } {
-  const crit = alerts.filter((a) => a.severity === 'critical').length;
-  const warn = alerts.filter((a) => a.severity === 'warning').length;
+  // v0.12.0 — drop on-screen backup-SoC alerts (id starts with 'backup-soc')
+  // before counting crit/warn. Their audible is the dedicated announce() path,
+  // so excluding them here keeps the condition-transition broadcast from
+  // double-chiming the same SoC crossing.
+  const counted = alerts.filter((a) => !a.id.startsWith('backup-soc'));
+  const crit = counted.filter((a) => a.severity === 'critical').length;
+  const warn = counted.filter((a) => a.severity === 'warning').length;
   const level: ConditionLevel = crit > 0 ? 'red' : warn > 0 ? 'yellow' : 'green';
   return { level, crit, warn };
 }
@@ -164,6 +169,16 @@ export interface BroadcastMonitor {
     error?: string;
     cooldownRemainingMs?: number;
   }>;
+  /**
+   * v0.12.0 — fire a dedicated, edge-triggered audible announcement for one
+   * backup-pool SoC threshold crossing. Renders chime(klaxonLevelForPriority)
+   * ×getChimeRepeat() + spoken `message` and plays it to BROADCAST_TARGETS via
+   * the SAME Music-Assistant path as runBroadcast()/test(). The SoC monitor
+   * already edge-limits crossings, so this skips test()/preview() cooldowns.
+   * No-ops (returns { ok:false, error:'broadcast disabled' }) when BROADCAST
+   * is off. Never throws.
+   */
+  announce: (priority: AlarmPriority, message: string) => Promise<{ ok: boolean; error?: string }>;
   config: () => BroadcastConfig;
   status: () => BroadcastStatus;
   stop: () => void;
@@ -547,6 +562,28 @@ export function startBroadcastMonitor(
       lastErrors = [];
       log(`broadcast: preview ${priority} (${level}) → played to ${cfg.targets.length} target(s)`);
       return { ok: true, spokenText, audioPath, played: 'speakers' };
+    },
+    // v0.12.0 — dedicated audible for one backup-SoC threshold crossing. Maps
+    // priority → klaxon level, then reuses runBroadcast() so the render (chime
+    // ×getChimeRepeat() + TTS) and the Music-Assistant play path are IDENTICAL
+    // to a real condition-transition broadcast. The SoC monitor edge-limits
+    // crossings, so we deliberately apply NO cooldown here. Never throws.
+    announce: async (priority: AlarmPriority, message: string): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        cfg = loadBroadcastConfig();
+        if (!cfg.enabled) return { ok: false, error: 'broadcast disabled' };
+        const level = klaxonLevelForPriority(priority);
+        const r = await runBroadcast(level, message);
+        lastBroadcastAt = Date.now();
+        lastLevel = level;
+        lastOutcome = r.ok ? 'success' : 'partial';
+        lastErrors = r.errors;
+        return r.ok ? { ok: true } : { ok: false, error: r.errors.join('; ') || 'broadcast failed' };
+      } catch (e: any) {
+        const err = e?.message ?? String(e);
+        log(`broadcast: announce failed: ${err}`);
+        return { ok: false, error: err };
+      }
     },
     config: () => cfg,
     status: () => ({

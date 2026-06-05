@@ -99,7 +99,9 @@ export function TrendChart({
     <div className="card col-span-full">
       <div className="card-title">{title}</div>
       <div style={{ width: '100%', height }}>
-        <ResponsiveContainer width="100%" height="100%">
+        {/* v0.12.0 — minWidth={0}/minHeight silence recharts' 0-size warning
+            when the parent measures 0 at mount; fixed px height unchanged. */}
+        <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={height}>
           <AreaChart data={merged} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
             <defs>
               {/* id must be space-free — series labels have spaces, which
