@@ -573,13 +573,18 @@ export function computeNovelty(
       devs: devs.sort((a, b) => Math.abs(b.deviation) - Math.abs(a.deviation)).slice(0, 3),
     };
   });
-  // Scale 0..100 by max distance in the fleet (so the most-novel pack = 100).
-  // When all distances are tiny (homogeneous fleet) skip scaling — everyone gets 0.
-  const maxDist = Math.max(...raw.map((r) => r.distance), 0.001);
+  // v0.13.5 — ABSOLUTE novelty mapping (Mahalanobis centroid distance). The old
+  // divide-by-max-distance scaling forced the single most-deviant pack to exactly
+  // 100 BY CONSTRUCTION — even on a perfectly healthy, homogeneous fleet there was
+  // always a "100% novel" pack, which is meaningless. sq = Σ standardized² is
+  // ~chi-square with `dim` degrees of freedom; normalising by its ≈99th-percentile
+  // (mean dim + 3·std, std=√(2·dim)) maps a genuine statistical outlier toward 100
+  // while a normal pack stays low, with NO dependence on the in-sample maximum.
+  const chi2Outlier = dim + 3 * Math.sqrt(2 * dim);
   return raw.map((r) => ({
     sn: r.sn,
     packNum: r.packNum,
-    novelty0to100: maxDist > 0.5 ? Math.round((r.distance / maxDist) * 100) : 0,
+    novelty0to100: Math.min(100, Math.round(((r.distance * r.distance) / chi2Outlier) * 100)),
     distanceFromCentroid: Math.round(r.distance * 100) / 100,
     topFeatures: r.devs,
   }));

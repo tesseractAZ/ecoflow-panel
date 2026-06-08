@@ -3,6 +3,16 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.13.5 — 2026-06-07
+
+**Completes the audit's P3-2 novelty-score fix (`computeNovelty` lives in `ml.ts`,
+outside the v0.13.3 analytics batch).** The pack-risk novelty score divided each
+pack's Mahalanobis centroid distance by the in-sample maximum, which forced the
+single most-deviant pack to exactly **100 by construction** — even a perfectly
+healthy fleet always had a "100% novel" pack. It now maps the absolute distance
+against the ≈99th percentile of its chi-square distribution, so a genuine
+statistical outlier trends toward 100 while normal packs stay low.
+
 ## 0.13.4 — 2026-06-07
 
 **New: power-plant annunciator chime pack (ISA-18.2 industrial alarm sounds).**
