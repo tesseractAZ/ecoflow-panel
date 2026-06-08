@@ -16,6 +16,14 @@ const MIN_INTERVAL_MS = 10_000;   // never record same metric more than once / 1
 const MAX_INTERVAL_MS = 300_000;  // heartbeat: record at least every 5 min even if unchanged
 const VALUE_EPSILON = 0.5;        // ignore wiggle smaller than this (watts/percent)
 
+// v0.13.1 — pseudo-device + metric names for the persisted weather-irradiance
+// series (the durable GHI backfill, see recordWeatherGhi). Stored under SN
+// "weather" so it shares the samples table + query() path with real devices
+// but never collides with a hardware SN.
+const WEATHER_SN = 'weather';
+const WEATHER_GHI_METRIC = 'ghi_wm2';     // global horizontal irradiance, W/m²
+const WEATHER_CLOUD_METRIC = 'cloud_pct'; // cloud cover, %
+
 /* ─── Lifetime-energy persistence (v0.7.6) ─────────────────────────────────
  * HA's Energy Dashboard expects monotonically-increasing kWh counters
  * (`state_class: total_increasing`). The samples table only retains 30
@@ -100,6 +108,15 @@ export interface Recorder {
     bucketSec?: number,
   ) => Map<string, Array<{ ts: number; value: number }>>;
   listMetrics: (sn: string) => string[];
+  /** v0.13.1 — persist hourly weather irradiance (GHI) + cloud cover under
+   * the pseudo-device SN "weather" so the historical series survives beyond
+   * the 2h in-memory weather cache / 7-day fetch window. Change-detected and
+   * idempotent: re-writing an already-stored hour is a no-op. Consumers
+   * (forecast-skill, soiling, solar-model training) read it back via
+   * query("weather", "ghi_wm2"|"cloud_pct", since, until). */
+  recordWeatherGhi: (
+    hours: Array<{ epochMs: number; radiationWm2: number | null; cloudCoverPct: number | null }>,
+  ) => void;
   close: () => void;
   /** Force a lifetime-rollup tick (used by tests / on shutdown). */
   rollupLifetime: () => void;
@@ -748,6 +765,61 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
     return out;
   };
 
+  // ─── Weather irradiance persistence (v0.13.1) ───────────────────────────
+  // Durable backfill of hourly GHI + cloud cover under SN "weather". Unlike
+  // the device samples (which are stamped with Date.now() and deduped by a
+  // wall-clock interval), each weather row is stamped with the FORECAST
+  // HOUR's own epoch so the series lines up with the device history it's
+  // correlated against. Idempotency + change-detection are therefore keyed
+  // on (sn, metric, ts): we skip a write when a row already exists at that
+  // hour, and skip an unchanged value relative to the previous stored hour
+  // (so a flat-irradiance night collapses to ~1 row, ~24 rows/day overall).
+  const weatherExistsStmt = db.prepare(
+    `SELECT 1 FROM samples WHERE sn = ? AND metric = ? AND ts = ? LIMIT 1`,
+  );
+  const weatherPrevStmt = db.prepare(
+    `SELECT value FROM samples WHERE sn = ? AND metric = ? AND ts < ? ORDER BY ts DESC LIMIT 1`,
+  );
+  const recordWeatherGhi = (
+    hours: Array<{ epochMs: number; radiationWm2: number | null; cloudCoverPct: number | null }>,
+  ) => {
+    if (!hours || hours.length === 0) return;
+    // Write chronologically so the "previous stored value" change-detection
+    // sees the just-written earlier hour within the same batch.
+    const sorted = [...hours].sort((a, b) => a.epochMs - b.epochMs);
+    const tx = db.prepare('BEGIN');
+    tx.run();
+    let written = 0;
+    try {
+      for (const h of sorted) {
+        if (!Number.isFinite(h.epochMs)) continue;
+        // Snap to the top of the hour so re-fetches that report the same hour
+        // with a different sub-hour offset still dedupe to one row.
+        const ts = Math.floor(h.epochMs / 3_600_000) * 3_600_000;
+        const pairs: Array<[string, number | null]> = [
+          [WEATHER_GHI_METRIC, h.radiationWm2],
+          [WEATHER_CLOUD_METRIC, h.cloudCoverPct],
+        ];
+        for (const [metric, value] of pairs) {
+          if (value == null || !Number.isFinite(value)) continue;
+          // Idempotent: a row already at this exact hour is a no-op.
+          if (weatherExistsStmt.get(WEATHER_SN, metric, ts)) continue;
+          // Change-detection: skip if the most-recent earlier hour already
+          // holds this value (within epsilon) — flat stretches collapse.
+          const prev = weatherPrevStmt.get(WEATHER_SN, metric, ts) as { value: number } | undefined;
+          if (prev && Math.abs(value - prev.value) < VALUE_EPSILON) continue;
+          insert.run(ts, WEATHER_SN, metric, value);
+          written++;
+        }
+      }
+      db.prepare('COMMIT').run();
+    } catch (e) {
+      db.prepare('ROLLBACK').run();
+      throw e;
+    }
+    if (written > 0) log(`recorder: v0.13.1 persisted ${written} weather GHI/cloud rows`);
+  };
+
   return {
     insertSnapshot: (snap) => record(extract(snap)),
     query: (sn, metric, sinceMs, untilMs, bucketSec) => {
@@ -780,6 +852,7 @@ export function createRecorder(store: SnapshotStore, log: (m: string) => void): 
       return out;
     },
     listMetrics: (sn) => (metricsStmt.all(sn) as Array<{ metric: string }>).map((r) => r.metric),
+    recordWeatherGhi,
     close: () => {
       clearInterval(lifetimeTimer);
       // Final rollup so we don't lose the trailing minute of energy on shutdown.

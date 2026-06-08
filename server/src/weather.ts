@@ -64,9 +64,15 @@ export async function getWeather(log: (m: string) => void = () => {}): Promise<W
   if (cache && Date.now() - cache.fetchedAt < TTL_MS) return cache;
 
   const { forecastLat: lat, forecastLon: lon } = config;
+  // v0.13.1 — past_days 3→7. The recorder now persists past+present GHI
+  // (see index.ts → recordWeatherGhi), so one fetch backfills a full week
+  // of irradiance into the recorder DB — immediately unblocking forecast-
+  // skill days 4-7 and feeding the soiling estimator beyond the 3-day
+  // window the in-memory cache could ever hold. Same free Open-Meteo
+  // endpoint, no key, one extra query param.
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    `&hourly=cloud_cover,shortwave_radiation,temperature_2m&forecast_days=2&past_days=3`;
+    `&hourly=cloud_cover,shortwave_radiation,temperature_2m&forecast_days=2&past_days=7`;
   try {
     const res = await request(url);
     if (res.statusCode >= 300) throw new Error(`HTTP ${res.statusCode}`);

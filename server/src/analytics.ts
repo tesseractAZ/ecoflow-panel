@@ -601,6 +601,11 @@ export interface DayForecast {
   hours: ForecastHour[];
   forecastPvWhNext24: number;
   typicalPvWhPerDay: number;
+  // v0.13.1 — 24-slot typical-day PV curve (Wh per hour-of-day, index 0=midnight).
+  // Sums to typicalPvWhPerDay. Exposed so the forecast backtest can use a diurnal
+  // baseline (night≈0, noon≈peak) via diurnalBaselinePredictor() instead of a flat
+  // typicalPvWhPerDay/24 — the flat line scored R²≈0 against real diurnal PV (P3-4).
+  typicalPvCurveWhPerHour: number[];
   minProjectedSoc: number | null;
   minProjectedSocTs: number | null;
   solarModel: SolarResponseModel;       // fleet-wide learned response
@@ -861,6 +866,17 @@ export async function getDayForecast(
   const hasWeather = !!weather && weather.hours.length > 0;
   const wxByHour = new Map<number, WeatherHour>();
   const ghiByEpoch = new Map<number, number>();
+  // v0.13.1 — durable GHI backfill. The solar-model training and soiling both
+  // run over TYPICAL_HISTORY_MS (30 days), but the in-memory weather cache only
+  // spans `past_days` (7) — so PV from days 8-30 had no GHI to pair with and was
+  // silently dropped from the fit. Seed from the recorder-persisted ghi_wm2 /
+  // cloud_pct series first (whole window), then let the live cache OVERWRITE
+  // recent hours (it's the freshest, with tempC + ensemble metadata).
+  mergeRecorderWeather(
+    wxByHour, ghiByEpoch,
+    recorder.query('weather', 'ghi_wm2', since, now, 3600),
+    recorder.query('weather', 'cloud_pct', since, now, 3600),
+  );
   if (weather)
     for (const wh of weather.hours) {
       const he = Math.floor(wh.ts / 3_600_000);
@@ -987,6 +1003,7 @@ export async function getDayForecast(
     hours,
     forecastPvWhNext24: Math.round(pvSum),
     typicalPvWhPerDay: Math.round(pvCurve.reduce((a, b) => a + b, 0)),
+    typicalPvCurveWhPerHour: pvCurve.map((w) => Math.round(w)), // v0.13.1 — for diurnal backtest baseline
     minProjectedSoc: minSoc == null ? null : Math.round(minSoc * 10) / 10,
     minProjectedSocTs: minSocTs,
     solarModel,
@@ -2725,6 +2742,13 @@ export interface ForecastSkillDay {
   actualKwh: number;
   errorKwh: number;
   errorPct: number | null;
+  // v0.13.1 — false when the day had ZERO GHI coverage (no weather irradiance
+  // for any hour). Such a day can't be hindcast — predictedKwh collapses to 0
+  // and errorPct would read a phantom -100%. The UI should show "no data", not
+  // a -100% miss. Days 4-7 used to be uncovered once the in-memory weather
+  // cache (3-day window) was the only GHI source; the recorder ghi_wm2 series
+  // now backfills a week, but a true gap still flags weatherCovered:false.
+  weatherCovered: boolean;
 }
 
 export interface ForecastSkillReport {
@@ -2737,6 +2761,102 @@ export interface ForecastSkillReport {
 }
 
 let forecastSkillCache: { ts: number; value: ForecastSkillReport } | null = null;
+
+/**
+ * v0.13.1 — durable GHI lookup keyed by hour-epoch (ms/3.6e6).
+ *
+ * The in-memory weather cache only spans `past_days` (now 7) and is wiped on
+ * restart / refetch, so any consumer that hindcasts more than a few days back
+ * lost its irradiance. The recorder now persists `ghi_wm2` under the pseudo-SN
+ * "weather" (change-detected, ~24 rows/day), surviving the cache window. Prefer
+ * that series; fall back to the live `weather.hours` cache when the recorder is
+ * sparse (cold start, before the first persisted fetch). The two are merged so
+ * a recorder gap inside the window is patched by whatever the cache still holds.
+ *
+ * Pure + exported so the per-consumer "did this day have ANY GHI?" check is
+ * unit-testable without standing up a real recorder/weather fetch.
+ */
+export function buildGhiByEpoch(
+  recorderRows: Array<{ ts: number; value: number }>,
+  cacheHours: WeatherHour[],
+): Map<number, number> {
+  const out = new Map<number, number>();
+  // Cache first, recorder second — the persisted series is the source of truth
+  // and overwrites cache entries for the same hour where both exist.
+  for (const wh of cacheHours) {
+    if (wh.radiationWm2 > 0) out.set(Math.floor(wh.ts / 3_600_000), wh.radiationWm2);
+  }
+  for (const row of recorderRows) {
+    if (row.value > 0) out.set(Math.floor(row.ts / 3_600_000), row.value);
+  }
+  return out;
+}
+
+/**
+ * v0.13.1 — backfill `wxByHour` + `ghiByEpoch` (keyed by hour-epoch) from the
+ * recorder-persisted ghi_wm2 / cloud_pct series, so consumers that fit over a
+ * window wider than the live weather cache (solar-model training + soiling,
+ * 30 days vs a 7-day cache) get irradiance for the older hours.
+ *
+ * Mutates in place (only sets hours not already present is NOT done here on
+ * purpose — the caller layers the live cache on top afterward so fresh hours
+ * win). cloud_pct is optional; default 0 (treated as clear) when absent, which
+ * matches Open-Meteo's "no cloud reported" and keeps soiling's clear-sky gate
+ * permissive. Pure + exported for unit testing.
+ */
+export function mergeRecorderWeather(
+  wxByHour: Map<number, WeatherHour>,
+  ghiByEpoch: Map<number, number>,
+  ghiRows: Array<{ ts: number; value: number }>,
+  cloudRows: Array<{ ts: number; value: number }>,
+): void {
+  const cloudByEpoch = new Map<number, number>();
+  for (const c of cloudRows) cloudByEpoch.set(Math.floor(c.ts / 3_600_000), c.value);
+  for (const g of ghiRows) {
+    const he = Math.floor(g.ts / 3_600_000);
+    ghiByEpoch.set(he, g.value);
+    wxByHour.set(he, {
+      ts: he * 3_600_000,
+      radiationWm2: g.value,
+      cloudCoverPct: cloudByEpoch.get(he) ?? 0,
+      tempC: 0, // not persisted — soiling/training don't read tempC
+    });
+  }
+}
+
+/** v0.13.1 — true when ANY hour of the local day [dayStart, dayStart+24h) has GHI. */
+export function dayHasGhiCoverage(ghiByEpoch: Map<number, number>, dayStartMs: number): boolean {
+  const startEpoch = Math.floor(dayStartMs / 3_600_000);
+  for (let h = 0; h < 24; h++) if (ghiByEpoch.has(startEpoch + h)) return true;
+  return false;
+}
+
+/**
+ * v0.13.1 — P3-4: diurnal baseline predictor for the forecast backtest.
+ *
+ * The old "typical-day-baseline" backtester predicted a FLAT
+ * typicalPvWhPerDay/24 for every hour — including 2am. Against real PV (≈0 all
+ * night, a midday hump) that flat line has essentially no correlation with the
+ * actual shape, so R² came out ≈0 (a measured r2≈-0.0006). A solar baseline
+ * that doesn't know night from noon isn't a baseline worth scoring against.
+ *
+ * Given the 24-slot typical-day PV curve (Wh per hour-of-day, e.g.
+ * DayForecast.pvCurve / the per-hour buckets that already sum to
+ * typicalPvWhPerDay), return predict(hourStartMs) → pvCurve[hourOfDay]. Night
+ * slots are ≈0 and the noon slot ≈peak, so the baseline tracks the diurnal
+ * shape and yields a real (positive) R². Pure + exported so the backtest route
+ * can build the predictor from the curve instead of a scalar.
+ */
+export function diurnalBaselinePredictor(pvCurveWhPerHour: number[]): (hourStartMs: number) => number {
+  // Defensive copy + normalize to 24 finite slots so a short/NaN curve can't
+  // poison the predictor (it's fed across a worker boundary).
+  const curve = new Array(24).fill(0);
+  for (let h = 0; h < 24; h++) {
+    const v = pvCurveWhPerHour[h];
+    curve[h] = Number.isFinite(v) && v > 0 ? v : 0;
+  }
+  return (hourStartMs: number) => curve[new Date(hourStartMs).getHours()];
+}
 
 export async function computeForecastSkill(
   devices: Record<string, DeviceSnapshot>,
@@ -2760,23 +2880,33 @@ export async function computeForecastSkill(
 
   // Hindcast: model.coeff[h] × GHI(h) for each past hour → predicted W.
   // Integrate hourly across each past day. Compare with actual hourly PV avg.
-  const wxByHourEpoch = new Map<number, WeatherHour>();
-  for (const wh of weather.hours) wxByHourEpoch.set(Math.floor(wh.ts / 3_600_000), wh);
-
   const todayStart = startOfLocalDayMs();
+  // v0.13.1 — GHI from the DURABLE recorder series first, the 3-day in-memory
+  // cache as fallback. The cache only spans `past_days` and is wiped on restart,
+  // so days 4-7 had ZERO irradiance and hindcast to predKwh=0 → a phantom
+  // errorPct=-100%. The recorder persists ghi_wm2 under SN "weather" over the
+  // whole window, so days >3 ago now have real GHI to hindcast against.
+  const windowStart = todayStart - windowDays * 86_400_000;
+  const ghiRows = recorder.query('weather', 'ghi_wm2', windowStart, now, 3600);
+  const ghiByEpoch = buildGhiByEpoch(ghiRows, weather.hours);
+
   const days: ForecastSkillDay[] = [];
   let totalPred = 0, totalAct = 0, errSum = 0, errCount = 0;
   for (let i = windowDays; i >= 1; i--) {
     const dayStart = todayStart - i * 86_400_000;
-    const dayEnd = dayStart + 86_400_000;
+    // v0.13.1 — a day with no irradiance for ANY hour can't be hindcast.
+    // Emit errorPct:null + weatherCovered:false instead of a predictedKwh=0 /
+    // errorPct=-100 row, and keep it out of the MAE/bias stats (which were
+    // already correct — they gate on predKwh/actKwh below).
+    const weatherCovered = dayHasGhiCoverage(ghiByEpoch, dayStart);
     let predWh = 0, actWh = 0;
     for (let h = 0; h < 24; h++) {
       const hourStart = dayStart + h * 3_600_000;
       const he = Math.floor(hourStart / 3_600_000);
-      const wx = wxByHourEpoch.get(he);
+      const ghi = ghiByEpoch.get(he);
       const hod = new Date(hourStart).getHours();
       const resp = forecast.solarModel.hourly[hod];
-      if (wx && resp.coeff != null) predWh += resp.coeff * wx.radiationWm2;
+      if (ghi != null && resp.coeff != null) predWh += resp.coeff * ghi;
       let act = 0;
       for (const d of dpus) {
         const pts = recorder.query(d.sn, 'pv_total', hourStart, hourStart + 3_600_000);
@@ -2788,7 +2918,7 @@ export async function computeForecastSkill(
     const predKwh = predWh / 1000;
     const actKwh = actWh / 1000;
     const errKwh = predKwh - actKwh;
-    const errPct = actKwh > 0.5 ? Math.round((errKwh / actKwh) * 1000) / 10 : null;
+    const errPct = weatherCovered && actKwh > 0.5 ? Math.round((errKwh / actKwh) * 1000) / 10 : null;
     const date = new Date(dayStart);
     days.push({
       date: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`,
@@ -2796,7 +2926,10 @@ export async function computeForecastSkill(
       actualKwh: round2(actKwh),
       errorKwh: round2(errKwh),
       errorPct: errPct,
+      weatherCovered,
     });
+    // Uncovered days never feed the stats — there's no prediction to score.
+    if (!weatherCovered) continue;
     // v0.10.4 — only "mature" days feed the skill stats. Warmup days, where
     // the solar model was barely trained and under-predicted grossly (predKwh
     // a small fraction of actual), passed the old `>0.5` gate and dragged
@@ -3363,8 +3496,8 @@ export interface MpptString {
   device: string;
   coreNum: number | null;
   string: 'HV' | 'LV';
-  recentEffPct: number | null;     // median ratio over the recent window
-  baselineEffPct: number | null;   // median ratio over the earliest 30% of history
+  recentEffPct: number | null;     // v0.13.1 — register-consistency ratio (W vs V·A), capped 100%; median over the recent window
+  baselineEffPct: number | null;   // register-consistency ratio (W vs V·A), capped 100%; median over the earliest 30% of history
   driftPctPts: number | null;      // recent − baseline (positive = healthy/improving, negative = drift)
   samples: number;
   spanDays: number;
@@ -3428,7 +3561,13 @@ function ratioSeries(
     if (dc < 50) continue; // ignore near-dark; ratio is dominated by noise
     if (w.value < 20) continue;
     const eff = (w.value / dc) * 100;
-    if (eff < 50 || eff > 105) continue; // clamp pathological / measurement-aligned outliers
+    // v0.13.1 — register-consistency ratio (W vs V·A), capped 100%. This is
+    // NOT a real conversion efficiency — W, V, and A are independent registers
+    // that should agree to ~100%; >100% means a measurement/register skew, not
+    // physics. Tightened 105→100.5 to mirror the v0.10.4 coulombic-eff fix
+    // (~analytics.ts:1356-1362): the old 105 band let register quirks surface
+    // impossible >100% medians. 100.5 tolerates rounding; drop the rest.
+    if (eff < 50 || eff > 100.5) continue; // clamp pathological / register-skew outliers
     out.push({ ts: w.ts, eff });
   }
   return out;
@@ -3467,8 +3606,13 @@ export function computeEquipmentHealth(
       const recent = series.filter((p) => p.ts >= now - RECENT_MS).map((p) => p.eff);
       const earliestCount = Math.max(10, Math.floor(series.length * 0.3));
       const baseline = series.slice(0, earliestCount).map((p) => p.eff);
-      const recentEff = recent.length ? median(recent) : null;
-      const baselineEff = baseline.length ? median(baseline) : null;
+      // v0.13.1 — cap the rendered median at 100%. Even with the per-sample
+      // 100.5 gate above, the median can land at 100.x from rounding; this is a
+      // register-consistency ratio, so a >100% headline reads as broken. The
+      // drift (recent − baseline) is computed from the CAPPED medians so the
+      // alert threshold (-3pp) still keys off a self-consistent series.
+      const recentEff = recent.length ? Math.min(100, median(recent)) : null;
+      const baselineEff = baseline.length ? Math.min(100, median(baseline)) : null;
       mpptStrings.push({
         sn: d.sn, device: d.deviceName, coreNum: dpuNum(d.deviceName), string: name,
         recentEffPct: recentEff != null ? round2(recentEff) : null,

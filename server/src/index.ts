@@ -553,6 +553,25 @@ app.get('/api/nws-alerts', async (req, reply) =>
 app.get('/api/weather/ensemble', async () => {
   const w = await getWeather((m) => app.log.info(m));
   if (!w) return { error: 'no weather available' };
+  // v0.13.1 — persist the past+present hours' GHI + cloud cover to the
+  // recorder so the irradiance series outlives the 2h in-memory weather
+  // cache. With past_days=7 (weather.ts) one fetch backfills a full week,
+  // which is what unblocks forecast-skill days 4-7 and feeds the soiling
+  // estimator. Change-detected + idempotent, so calling this on every
+  // (cached or fresh) fetch is cheap and never duplicates rows.
+  if (recorder && w.hours.length > 0) {
+    try {
+      recorder.recordWeatherGhi(
+        w.hours.map((h) => ({
+          epochMs: h.ts,
+          radiationWm2: h.radiationWm2,
+          cloudCoverPct: h.cloudCoverPct,
+        })),
+      );
+    } catch (e: any) {
+      app.log.warn(`weather: GHI persistence failed (${e?.message ?? e}) — live forecast unaffected`);
+    }
+  }
   return {
     fetchedAt: w.fetchedAt,
     lat: w.lat, lon: w.lon,

@@ -3,6 +3,27 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.13.1 — 2026-06-07
+
+**Forecasting & solar-data fixes from the 7-day audit (batch 2 of 4).**
+
+- **Persist solar irradiance (GHI) to the recorder.** Weather forecasts previously
+  lived only in a 2-hour in-memory cache fetched `past_days=3`, so anything older than
+  3 days was lost — which is why forecast-skill showed −100% for days 4–7, PV soiling
+  could *never* accumulate its required 6 clean days, and the solar model trained on
+  only 3 of ~30 available PV days. The recorder now persists `ghi_wm2` + `cloud_pct`
+  under a `weather` pseudo-device on every successful fetch (and `past_days` is bumped
+  3 → 7), and forecast-skill / soiling / solar-model training read the durable series.
+- **Forecast-skill no longer reports −100% for un-hindcastable days.** A day with zero
+  GHI coverage now returns `errorPct: null` + `weatherCovered: false` instead of a
+  `predictedKwh: 0` / −100% row. (Aggregate MAE/bias were always correct — only the
+  per-day rows were misleading.)
+- **MPPT "efficiency" can no longer read >100%.** The register-consistency ratio (panel
+  watts vs V·A from two independently-quantized register blocks) is clamped 105 → 100.5
+  and the rendered median capped at 100%, mirroring the v0.10.4 coulombic-efficiency
+  fix. The −3 pp drift alert threshold is unchanged. Field relabeled accordingly.
+- Tests: GHI persistence round-trip + change-detection; forecast-skill null-coverage guard.
+
 ## 0.13.0 — 2026-06-07
 
 **Data-integrity fixes from the 7-day real-world performance audit (batch 1 of 4).**

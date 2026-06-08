@@ -78,6 +78,7 @@ export function createReadRecorder(dbPathInput?: string): Recorder {
     insertSnapshot: () => {},
     rollupLifetime: () => {},
     getLifetimeTotals: () => noopLifetime,
+    recordWeatherGhi: () => {}, // v0.13.1 — write path; the read-only worker never writes
     // ── read path: real ──
     query: (sn, metric, sinceMs, untilMs, bucketSec) => {
       if (!bucketSec || bucketSec <= 0) {
