@@ -3,6 +3,20 @@
 All notable changes to this add-on are listed here. Versioning follows
 [Semantic Versioning](https://semver.org).
 
+## 0.13.6 — 2026-06-07
+
+**Reconciles the audit's novelty fix to the documented chi-square parameterization,
+adds the P3-2/P3-4 regression tests.**
+
+- `computeNovelty` (P3-2) now maps the absolute Mahalanobis centroid distance with a
+  fixed `CHI2_THRESHOLD = 3.4` cutoff (`min(1, distance / CHI2_THRESHOLD)`), replacing
+  the v0.13.5 chi-square-on-distance² variant — both fix the divide-by-max pinning bug;
+  this matches the documented spec and is simpler to reason about. Finished renaming
+  the detector "isolation-forest-lite" → "Mahalanobis centroid distance" in the comments.
+- Added the dedicated regression tests the audit called for: `mlNoveltyAbsolute.test.ts`
+  (healthy fleet not pinned to 100, real outlier saturates, monotonic in distance) and
+  `backtestDiurnal.test.ts` (diurnal predictor: noon = peak, 2am ≈ 0, night ≠ noon).
+
 ## 0.13.5 — 2026-06-07
 
 **Completes the audit's P3-2 novelty-score fix (`computeNovelty` lives in `ml.ts`,

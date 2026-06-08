@@ -42,7 +42,7 @@ import { shp2ConnectedDpuSns, isShp2Connected } from './shp2Membership.js';
  *     `npm run train`, restart. Production code uses the new weights
  *     with zero changes. `modelVersion` bumps to `lr-labeled-v1`.
  *
- *   - The **isolation-forest-lite novelty detector** here is real
+ *   - The **Mahalanobis centroid-distance novelty detector** here is real
  *     unsupervised ML — no labels needed. For each pack, compute its
  *     feature-vector distance from the fleet centroid (Mahalanobis-style
  *     using inverse stdev). A pack that's an outlier in feature space
@@ -509,13 +509,14 @@ export interface NoveltyResult {
 }
 
 /**
- * Compute per-pack novelty as Mahalanobis-style distance from the fleet
- * centroid in feature space. Uses inverse-stdev weighting per feature
- * so all features contribute on a common scale. Truly unsupervised.
+ * Compute per-pack novelty as the Mahalanobis centroid distance: each pack's
+ * inverse-stdev-weighted distance from the fleet centroid in feature space, so
+ * all features contribute on a common scale. Truly unsupervised.
  *
- * Output 0..100 where 100 = the pack's feature vector is the furthest
- * from the fleet mean (scaled by the max distance in the fleet, so
- * the worst-novelty pack always scores 100 and others scale linearly).
+ * Output 0..100, mapped ABSOLUTELY against a fixed chi-square cutoff
+ * (CHI2_THRESHOLD) — a pack only reads 100 once its distance actually reaches
+ * the outlier threshold. (It used to divide by the in-sample MAX distance,
+ * which pinned the single most-deviant pack to 100 even on a healthy fleet.)
  */
 /**
  * v0.9.76 — accepts an optional `baseline` pool of feature vectors that
@@ -527,9 +528,10 @@ export interface NoveltyResult {
  * dominate the centroid mass and compress the spread, then home-pack
  * anomalies look extreme against an artificially deflated cloud.
  *
- * Live evidence pre-fix: Core 1 Pack 4 scored novelty=100 while 24 other
- * packs sat at novelty=4 — the maxDist scaling was dominated by one
- * away-from-spare-cluster pack instead of one truly anomalous one.
+ * Live evidence pre-fix: Core 1 Pack 4 scored novelty=100 while 24 other packs
+ * sat at novelty=4 — partly the spare-deflated centroid (fixed by the baseline
+ * pool here), partly the old divide-by-max scaling (replaced in v0.13.x by the
+ * absolute chi-square mapping below).
  */
 export function computeNovelty(
   features: FeatureVector[],
@@ -573,18 +575,19 @@ export function computeNovelty(
       devs: devs.sort((a, b) => Math.abs(b.deviation) - Math.abs(a.deviation)).slice(0, 3),
     };
   });
-  // v0.13.5 — ABSOLUTE novelty mapping (Mahalanobis centroid distance). The old
-  // divide-by-max-distance scaling forced the single most-deviant pack to exactly
-  // 100 BY CONSTRUCTION — even on a perfectly healthy, homogeneous fleet there was
-  // always a "100% novel" pack, which is meaningless. sq = Σ standardized² is
-  // ~chi-square with `dim` degrees of freedom; normalising by its ≈99th-percentile
-  // (mean dim + 3·std, std=√(2·dim)) maps a genuine statistical outlier toward 100
-  // while a normal pack stays low, with NO dependence on the in-sample maximum.
-  const chi2Outlier = dim + 3 * Math.sqrt(2 * dim);
+  // v0.13.3 — ABSOLUTE novelty mapping. The old divide-by-in-sample-max scaling
+  // forced the single most-deviant pack to exactly 100 BY CONSTRUCTION — even a
+  // perfectly healthy, homogeneous fleet always had a "100% novel" pack, which is
+  // meaningless. Instead map the absolute Mahalanobis centroid distance against a
+  // fixed chi-square cutoff: with `dim`=6 standardized features, distance² is
+  // ~chi-square_dim and CHI2_THRESHOLD≈3.4 marks "this pack is a genuine outlier".
+  // A pack reads 100 only once its distance actually reaches the threshold; a
+  // tight, healthy fleet shows everyone low — no in-sample-maximum coupling.
+  const CHI2_THRESHOLD = 3.4;
   return raw.map((r) => ({
     sn: r.sn,
     packNum: r.packNum,
-    novelty0to100: Math.min(100, Math.round(((r.distance * r.distance) / chi2Outlier) * 100)),
+    novelty0to100: Math.round(Math.min(1, r.distance / CHI2_THRESHOLD) * 100),
     distanceFromCentroid: Math.round(r.distance * 100) / 100,
     topFeatures: r.devs,
   }));
