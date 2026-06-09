@@ -231,7 +231,14 @@ export async function renderAnnouncement(opts: RenderOptions): Promise<RenderRes
       let klaxonOnly = klaxonWav;
       if (silence.length > 0 || chimeRepeat > 1 || announceRepeat > 1) {
         const klaxonPcm = klaxonWav.subarray(klaxonHeader.dataOffset, klaxonHeader.dataOffset + klaxonHeader.dataLength);
-        const pcm = Buffer.concat([silence, ...Array<Buffer>(chimeRepeat * announceRepeat).fill(klaxonPcm)]);
+        // Build the chime list with a bounded push-loop rather than Array(n).fill():
+        // chimeRepeat is already guarded to ≤ MAX_CHIME_REPEAT and announceRepeat to
+        // ≤3, so this is small — and avoiding allocation-by-length keeps it off the
+        // resource-exhaustion path entirely. Byte-identical to the old .fill() form.
+        const chimeParts: Buffer[] = [silence];
+        const totalChimes = chimeRepeat * announceRepeat;
+        for (let i = 0; i < totalChimes; i++) chimeParts.push(klaxonPcm);
+        const pcm = Buffer.concat(chimeParts);
         klaxonOnly = pcmToWav(pcm, klaxonHeader.rate, klaxonHeader.width, klaxonHeader.channels);
       }
       await writeFile(outPath, klaxonOnly);
@@ -278,8 +285,12 @@ export async function renderAnnouncement(opts: RenderOptions): Promise<RenderRes
   const silence = makeSilencePcm(klaxonHeader, leadMs);
   // v0.15.4 — one block = chime×chimeRepeat + the spoken message; the whole block
   // repeats announceRepeat times so a missed first pass gets a second. The lead-in
-  // silence stays once, up front.
-  const block: Buffer[] = [...Array<Buffer>(chimeRepeat).fill(klaxonPcm), ttsPcm];
+  // silence stays once, up front. The chime list is built with a bounded push-loop
+  // (chimeRepeat is guarded to ≤ MAX_CHIME_REPEAT) rather than Array(n).fill(), to
+  // keep it off the resource-exhaustion path — byte-identical to the old form.
+  const block: Buffer[] = [];
+  for (let i = 0; i < chimeRepeat; i++) block.push(klaxonPcm);
+  block.push(ttsPcm);
   const parts: Buffer[] = [silence];
   for (let i = 0; i < announceRepeat; i++) parts.push(...block);
   const combinedPcm = Buffer.concat(parts);
