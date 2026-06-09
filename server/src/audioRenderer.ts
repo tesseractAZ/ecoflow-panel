@@ -168,10 +168,15 @@ export async function renderAnnouncement(opts: RenderOptions): Promise<RenderRes
   // v0.15.4 — re-assert a hard upper bound at the point of use. getChimeRepeat()
   // is already clamped to ≤4 by clampChime(), but bounding locally guarantees the
   // Array(chimeRepeat[*announceRepeat]) allocations below can never grow unbounded
-  // even if that distant clamp regresses — defense-in-depth on the alert path
-  // (and a recognised resource-exhaustion sanitizer). The cap is well above the
-  // settings max, so it never changes real behaviour or the cache key.
-  const chimeRepeat = Math.max(1, Math.min(MAX_CHIME_REPEAT, Math.round(getChimeRepeat())));
+  // even if that distant clamp regresses — defense-in-depth on the alert path.
+  // The cap is well above the settings max, so it never changes real behaviour or
+  // the cache key. NOTE: this is written as an explicit comparison GUARD rather
+  // than Math.min() on purpose — CodeQL's js/resource-exhaustion taint tracker
+  // recognises a relational upper-bound check as a sanitizer, but not Math.min(),
+  // and the guard must be inline here (an interprocedural helper isn't trusted at
+  // the allocation sink).
+  let chimeRepeat = Math.max(1, Math.round(getChimeRepeat()));
+  if (chimeRepeat > MAX_CHIME_REPEAT) chimeRepeat = MAX_CHIME_REPEAT;
   // v0.15.4 — repeat the whole (chime + spoken message) block N times so a missed
   // first annunciation gets a second pass. Clamped 1..3; part of the cache key.
   const announceRepeat = Math.max(1, Math.min(3, Math.round(opts.announceRepeat ?? 1)));
