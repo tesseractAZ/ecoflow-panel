@@ -454,10 +454,18 @@ function SummaryStrip({
   // Floored like the per-pack tile: summed fullCap can exceed summed design after a fleet
   // BMS recalibration, which would otherwise render an impossible "-x% degraded" at the pool.
   const degraded = designMah > 0 ? Math.max(0, (1 - fullMah / designMah) * 100) : null;
-  // Only claim "wired into the pool" when a real SHP2 membership set exists. With no SHP2,
-  // isShp2Connected() returns true for EVERY SN (empty-set fallback), so staleCores could
-  // include an unwired spare — don't assert it's wired to a pool that isn't there.
-  const staleNote = shp2 && staleCores.length
+  // The "wired into the pool" claim requires a REAL, non-empty membership set. When
+  // connectedSns is empty — no SHP2, OR an SHP2 whose sources haven't populated yet (cold
+  // boot / SHP2 offline) — isShp2Connected() returns true for EVERY SN, so staleCores could
+  // include an unwired spare. Gate on connectedSns.size, not merely `shp2` presence.
+  const haveMembership = connectedSns.size > 0;
+  const staleActive = haveMembership && staleCores.length > 0;
+  // Capacity is whole-pool (SHP2 aggregate, includes a stale wired core) but degradation is
+  // per-pack over the REPORTING cores only — qualify it so "X% degraded" under a whole-pool
+  // capacity isn't misread as pool-wide when a core is excluded.
+  const degradedSub =
+    degraded != null ? `${degraded.toFixed(2)}% degraded${staleActive ? ' (reporting cores)' : ''}` : null;
+  const staleNote = staleActive
     ? `incl. ${staleCores.map((d) => d.deviceName).join(', ')} (wired, cloud-stale)`
     : undefined;
 
@@ -475,7 +483,7 @@ function SummaryStrip({
         <Tile
           label="Capacity"
           value={`${poolCapKwh.toFixed(1)} kWh`}
-          sub={[degraded != null ? `${degraded.toFixed(2)}% degraded` : null, staleNote].filter(Boolean).join(' · ') || undefined}
+          sub={[degradedSub, staleNote].filter(Boolean).join(' · ') || undefined}
         />
         <Tile label="Hottest pack" value={fmtF(hottest?.c)} sub={hottest?.tag} accent={hottest && cToF(hottest.c) >= HOT_F ? 'text-warn' : undefined} />
         <Tile
