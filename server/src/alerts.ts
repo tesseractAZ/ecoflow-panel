@@ -504,7 +504,13 @@ export function computeAlerts(
   // block (sp.backupReserveSoc ?? 15). The audible SoC alarm ladder is
   // untouched — this only gates the on-screen mirror.
   const socReserve = socShp2?.projection.backupReserveSoc ?? 15;
-  const coveredByShp2Pair = soc != null && soc < socReserve + 10;
+  // v0.44.0 — only treat the window as "covered" when the shp2-near/below pair is
+  // actually ELIGIBLE to emit, i.e. the SHP2 is ONLINE (that pair is gated on
+  // `shp2?.online` at line ~430). When the SHP2 is cloud-offline its projection —
+  // hence `soc` — is still preserved by the snapshot store, but the pair does NOT
+  // fire; suppressing the band too would drop the low-SoC reserve alert entirely.
+  // Gating here keeps the band as the fallback on a faulted/offline SHP2.
+  const coveredByShp2Pair = socShp2?.online === true && soc != null && soc < socReserve + 10;
   if (band !== null && soc != null && !coveredByShp2Pair) {
     // v0.23.0 — grid backstopping ⇒ a low pool is a non-event; collapse the
     // emergency tiers (high/critical) to a low advisory so this on-screen alert

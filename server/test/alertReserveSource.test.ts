@@ -26,6 +26,11 @@ function shp2(backupBatPercent: number | null, backupReserveSoc = 10): DeviceSna
     projection: { kind: 'shp2', backupBatPercent, backupReserveSoc, sources: [], pairedCircuits: [] } as any,
   } as DeviceSnapshot;
 }
+// Same SHP2 but cloud-OFFLINE: the snapshot store still preserves `projection`
+// (hence backupBatPercent), but the shp2-near/below pair is gated on `online`.
+function shp2Offline(backupBatPercent: number | null, backupReserveSoc = 10): DeviceSnapshot {
+  return { ...shp2(backupBatPercent, backupReserveSoc), online: false } as DeviceSnapshot;
+}
 const devices = (...arr: DeviceSnapshot[]): Record<string, DeviceSnapshot> =>
   Object.fromEntries(arr.map((d) => [d.sn, d]));
 
@@ -77,4 +82,25 @@ test('backup-soc band EMITTED just above the reserve window (no condition droppe
   assert.equal(a!.id, 'backup-soc-20');
   assert.equal(priorityOf(a!), 'medium');
   assert.equal(nearReserve(alerts), undefined, 'shp2-near-reserve not firing at soc=20 (>= reserve+10)');
+});
+
+/* ─── (3) offline SHP2: band is the FALLBACK (regression — Copilot #88) ─── */
+
+test('backup-soc band EMITTED when SHP2 is OFFLINE inside the reserve window (pair cannot fire)', () => {
+  // soc=14, reserve=10 ⇒ inside the reserve+10 window, but the SHP2 is cloud-
+  // offline so shp2-near/below-reserve (gated on `online`) do NOT emit. If the
+  // band were still suppressed here, a low-SoC condition would have NO on-screen
+  // alert at all. The dedup must release when the pair is ineligible.
+  const alerts = computeAlerts(devices(shp2Offline(14, 10)));
+  assert.equal(nearReserve(alerts), undefined, 'offline SHP2 ⇒ shp2-near-reserve cannot fire');
+  assert.equal(belowReserve(alerts), undefined, 'offline SHP2 ⇒ shp2-below-reserve cannot fire');
+  const a = backupSoc(alerts);
+  assert.ok(a, 'band must remain as the fallback low-SoC alert when SHP2 is offline');
+  assert.equal(a!.source, 'threshold');
+});
+
+test('backup-soc band EMITTED when SHP2 is OFFLINE below reserve (pair cannot fire)', () => {
+  const alerts = computeAlerts(devices(shp2Offline(8, 10)));
+  assert.equal(belowReserve(alerts), undefined, 'offline SHP2 ⇒ no shp2-below-reserve');
+  assert.ok(backupSoc(alerts), 'band is the sole low-SoC producer when SHP2 offline');
 });
