@@ -276,6 +276,31 @@ export function planCircuitDiscovery(
   return { sig, publish, clear };
 }
 
+/**
+ * v0.40.2 — per-circuit lifetime-kWh state fields, enumerated from the SAME source the
+ * discovery configs use (`shp2.projection.circuits`), NOT from the recorder's lifetime
+ * accumulator keys. Previously the state emitted a `circuit_<ch>_lifetime_kwh` key only
+ * for circuits that already had a `circuit_<ch>_wh` accumulator entry, while discovery
+ * created a sensor for EVERY live circuit. A circuit that was live but whose accumulator
+ * key wasn't present yet (cold start, just-added circuit, or a brief `watts==null` gap)
+ * therefore had a retained HA sensor whose `value_template '{{ value_json.circuit_N_lifetime_kwh }}'`
+ * referenced a key the state omitted → HA logged a "'dict object' has no attribute
+ * circuit_N_lifetime_kwh" template warning on every render until they re-converged.
+ *
+ * Emitting a field for every live circuit keeps discovery ⟷ state consistent. The value
+ * is `null` (NOT 0) when the accumulator isn't ready — HA renders that as unavailable
+ * rather than a counter drop to 0, which a `total_increasing` sensor would treat as a
+ * spurious reset.
+ */
+export function circuitLifetimeFields(
+  circuits: ReadonlyArray<{ ch: number }>,
+  lifetimeKwh: (k: string) => number | null,
+): Record<string, number | null> {
+  return Object.fromEntries(
+    circuits.map((c) => [`circuit_${c.ch}_lifetime_kwh`, lifetimeKwh(`circuit_${c.ch}_wh`)]),
+  );
+}
+
 export interface MqttDiscoveryHandle {
   stop: () => void;
   client: MqttClient | null;
@@ -561,14 +586,10 @@ export async function startMqttDiscovery(
       battery_charge_lifetime_kwh: lifetimeKwh('fleet_battery_charge_wh'),
       battery_discharge_lifetime_kwh: lifetimeKwh('fleet_battery_discharge_wh'),
       // v0.8.0 — per-circuit lifetime + carbon + tariff
-      ...Object.fromEntries(
-        Object.keys(lifetime)
-          .filter((k) => k.startsWith('circuit_'))
-          .map((k) => [
-            `circuit_${k.match(/^circuit_(\d+)_wh$/)?.[1]}_lifetime_kwh`,
-            lifetimeKwh(k),
-          ]),
-      ),
+      // v0.40.2 — enumerate from the live circuit list (same as discovery), not the
+      // accumulator keys, so every discovered per-circuit sensor always has its key in
+      // the payload (fixes the "circuit_N_lifetime_kwh" HA template warning).
+      ...circuitLifetimeFields(shp2 ? shp2.projection.circuits : [], lifetimeKwh),
       carbon_kg_avoided_7d: carbon.totalKgAvoided,
       carbon_lifetime_kg_avoided: carbon.lifetimeKgAvoided,
       carbon_lifetime_miles_not_driven: carbon.lifetimeMilesNotDriven,
