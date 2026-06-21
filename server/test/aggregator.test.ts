@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { integrateWh, startOfLocalDayMs, circuitHistoryByDay } from '../src/aggregator.js';
+import { integrateWh, startOfLocalDayMs, circuitHistoryByDay, computeTotals } from '../src/aggregator.js';
 import type { Recorder } from '../src/recorder.js';
+import type { SnapshotStore } from '../src/snapshot.js';
+import type { DeviceSnapshot } from '../src/snapshot.js';
 
 /**
  * Tests for the trapezoidal kWh integrator + gap behavior. This function
@@ -191,4 +193,97 @@ test('circuitHistoryByDay — paired metric integrates to combined kWh', () => {
   assert.ok(Math.abs(h.days[0].kwh - 2) < 0.05, `expected yesterday ~2 kWh, got ${h.days[0].kwh}`);
   assert.equal(h.days[0].peakW, 2000);
   assert.equal(h.ch, 10); // still keyed by primary leg
+});
+
+/* ─── computeTotals fleet.pvCoverage (v0.44.0) ─────────────────────────────
+ *
+ * The Solar page's "% measured" tile must reflect coverage of the PV series
+ * (`pv_total`) ALONE, not the unweighted mean of every recorder metric (grid,
+ * load, battery, temps…). This pins that fleet.pvCoverage filters to `pv_total`
+ * and therefore diverges from fleet.coverage whenever the non-PV metrics have
+ * different coverage. No SHP2 in the snapshot ⇒ membership-unknown fallback
+ * counts the lone DPU into the fleet rollup (see shp2Membership.ts).
+ */
+function oneDpuStore(): SnapshotStore {
+  const sn = 'SN-PVCOV';
+  const devices: Record<string, DeviceSnapshot> = {
+    [sn]: {
+      sn,
+      deviceName: 'Core 1',
+      online: true,
+      lastSeenMs: Date.now(),
+      projection: {
+        kind: 'dpu',
+        soc: 80,
+        packs: [{ num: 1, soc: 80 }],
+      } as any,
+    } as any,
+  };
+  return { get: () => ({ devices }) } as unknown as SnapshotStore;
+}
+
+test('computeTotals — fleet.pvCoverage reflects ONLY the PV metric, not the all-metric mean', () => {
+  const since = startOfLocalDayMs() - ONE_HOUR; // a clean closed 1-hour window
+  const until = startOfLocalDayMs();
+  // PV (`pv_total`): dense samples across the WHOLE window → ~full coverage.
+  const pvPts = evenSamples(since, until, FIVE_MIN, 1000);
+  // Every NON-PV metric computeTotals ingests for a 1-pack DPU: cover only the
+  // first half of the window, then stop. integrateWh won't hold the tail to
+  // `until` (it's 30 min away, > the 10-min maxGap) → ~0.5 coverage each.
+  const halfPts = evenSamples(since, since + ONE_HOUR / 2, FIVE_MIN, 1000);
+  const rec = mockRecorder({
+    pv_total: pvPts,
+    ac_out: halfPts,
+    total_in: halfPts,
+    total_out: halfPts,
+    pack1_in: halfPts,
+    pack1_out: halfPts,
+  });
+
+  const r = computeTotals(oneDpuStore(), rec, since, until);
+
+  // PV-only coverage tracks the dense pv_total series → ~1.0.
+  assert.ok(r.fleet.pvCoverage > 0.98, `pvCoverage ${r.fleet.pvCoverage} should be ~1.0 (PV densely covered)`);
+  // All-metric coverage is dragged DOWN by the five half-covered non-PV metrics
+  // (mean of [~1.0, 0.5, 0.5, 0.5, 0.5, 0.5] ≈ 0.58) → must be well below pvCoverage.
+  assert.ok(r.fleet.coverage < 0.75, `coverage ${r.fleet.coverage} should be diluted by the half-covered non-PV metrics`);
+  assert.ok(
+    r.fleet.pvCoverage - r.fleet.coverage > 0.2,
+    `pvCoverage (${r.fleet.pvCoverage}) must materially exceed all-metric coverage (${r.fleet.coverage}) — proving PV-only filtering`,
+  );
+});
+
+test('computeTotals — empty pv_total series over a real window ⇒ pvCoverage = 0 (genuine 0% PV, not NaN)', () => {
+  const since = startOfLocalDayMs() - ONE_HOUR;
+  const until = startOfLocalDayMs();
+  const halfPts = evenSamples(since, since + ONE_HOUR / 2, FIVE_MIN, 1000);
+  // No pv_total samples, but the window is real, so the DPU's pv_total ingest
+  // contributes a 0-coverage observation: that's a true "PV produced no
+  // measured data" reading, and pvCoverage should be 0 — NOT carried away by
+  // the half-covered non-PV metrics, and never NaN.
+  const rec = mockRecorder({
+    ac_out: halfPts,
+    total_in: halfPts,
+    total_out: halfPts,
+    pack1_in: halfPts,
+    pack1_out: halfPts,
+  });
+
+  const r = computeTotals(oneDpuStore(), rec, since, until);
+
+  assert.ok(Number.isFinite(r.fleet.pvCoverage), 'pvCoverage must be finite, never NaN');
+  assert.equal(r.fleet.pvCoverage, 0, 'empty pv_total over a real window ⇒ 0% PV coverage');
+  // And it still differs from the all-metric coverage (which the non-PV metrics lift above 0).
+  assert.ok(r.fleet.coverage > 0, 'all-metric coverage is non-zero (non-PV metrics have data)');
+});
+
+test('computeTotals — degenerate zero-width window ⇒ pvCoverage falls back to coverage (both 0, no NaN)', () => {
+  // totalMs === 0 ⇒ no metric pushes a coverage observation ⇒ both accums empty.
+  // The guard makes pvCoverage fall back to coverage (0) rather than 0/0 = NaN.
+  const t = startOfLocalDayMs();
+  const rec = mockRecorder({ pv_total: [], ac_out: [], pack1_in: [], pack1_out: [], total_in: [], total_out: [] });
+  const r = computeTotals(oneDpuStore(), rec, t, t);
+  assert.ok(Number.isFinite(r.fleet.pvCoverage), 'pvCoverage must be finite (guard prevents 0/0 NaN)');
+  assert.equal(r.fleet.coverage, 0, 'degenerate window ⇒ all-metric coverage 0');
+  assert.equal(r.fleet.pvCoverage, r.fleet.coverage, 'degenerate guard ⇒ pvCoverage === coverage');
 });
