@@ -448,11 +448,14 @@ The five `state_class: total_increasing` sensors above feed straight into
 Home Assistant's built-in **Energy Dashboard**. Once they're created,
 go to **Settings → Dashboards → Energy** and wire them in:
 
-- **Electricity grid → Add consumption** → `sensor.ecoflow_grid_to_home_lifetime_kwh`
-  (MQTT discovery: **"EcoFlow Grid Import (Home)"** = `sensor.ecoflow_panel_ecoflow_grid_to_home`).
-  ⚠️ Do **not** pick "EcoFlow Grid to Battery Charge" (`…_grid_import_lifetime_kwh`, the DPU
-  `ac_in` subset) — it's near-zero on a solar-charged home, so the grid bar would read 0.
-  The home's true grid import is metered at the SHP2 main (`gridWatt`).
+- **Electricity grid → Add consumption** → `sensor.ecoflow_grid_import_home`
+  (the REST sensor above — HA derives the entity_id from its `name:` "EcoFlow Grid Import
+  (Home)". If you use MQTT discovery instead, the equivalent entity is
+  `sensor.ecoflow_panel_ecoflow_grid_to_home`.)
+  ⚠️ Do **not** pick "EcoFlow Grid to Battery Charge" (the DPU `ac_in` subset — REST
+  entity `sensor.ecoflow_grid_to_battery_charge`) — it's near-zero on a solar-charged
+  home, so the grid bar would read 0. The home's true grid import is metered at the SHP2
+  main (`gridWatt`).
 - **Solar panels → Add solar production** → `sensor.ecoflow_pv_production`
 - **Home battery storage → Add battery system** →
   - *Energy going IN to the battery* → `sensor.ecoflow_battery_energy_in`
