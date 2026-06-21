@@ -454,7 +454,10 @@ function SummaryStrip({
   // Floored like the per-pack tile: summed fullCap can exceed summed design after a fleet
   // BMS recalibration, which would otherwise render an impossible "-x% degraded" at the pool.
   const degraded = designMah > 0 ? Math.max(0, (1 - fullMah / designMah) * 100) : null;
-  const staleNote = staleCores.length
+  // Only claim "wired into the pool" when a real SHP2 membership set exists. With no SHP2,
+  // isShp2Connected() returns true for EVERY SN (empty-set fallback), so staleCores could
+  // include an unwired spare — don't assert it's wired to a pool that isn't there.
+  const staleNote = shp2 && staleCores.length
     ? `incl. ${staleCores.map((d) => d.deviceName).join(', ')} (wired, cloud-stale)`
     : undefined;
 
