@@ -274,10 +274,19 @@ function DeviceInference({ dm }: { dm: DeviceSolarModel }) {
   const hv = peakResponse(dm.hv);
   const lv = peakResponse(dm.lv);
   if (!whole && !hv && !lv) {
+    // v0.41.0 (Copilot follow-up) — peakResponse() now returns null both when there's no
+    // PV at all AND when PV exists but no hour clears the r²/sample fit gate. Don't claim
+    // "No recorded PV" in the latter case: productionCentroidHour() keys off observedMaxPvW
+    // (raw production, fit-independent), so it tells the two apart truthfully.
+    const hasPv = productionCentroidHour(dm.model) != null;
     return (
       <Inference
         label={dm.device}
-        detail="No recorded PV — offline gaps or an unwired spare; orientation can't be inferred yet."
+        detail={
+          hasPv
+            ? 'PV recorded, but the GHI→PV response is still calibrating — not enough well-fit hours to infer orientation yet.'
+            : "No recorded PV — offline gaps or an unwired spare; orientation can't be inferred yet."
+        }
         muted
       />
     );

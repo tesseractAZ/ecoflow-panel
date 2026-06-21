@@ -475,8 +475,16 @@ export function computeForecastAlerts(devices: Record<string, DeviceSnapshot>, r
   // minProjectedSoc — so the cache still survives the per-cycle forecast jitter and only
   // invalidates when the depletion verdict actually flips.
   const reserveForGate = shp2?.projection.backupReserveSoc ?? 15;
+  // v0.41.0 (Copilot follow-up) — compare against the forecast's OWN reserve floor when it
+  // carries one: `minProjectedSoc` was projected relative to `forecast.reserveSoc` (see
+  // getDayForecast, which sets reserveSoc = backupReserveSoc ?? 15 and tests the same
+  // `minProjectedSoc < reserveSoc` for its own depletion alert). Falling back to the live
+  // SHP2 reserve keeps the gate self-consistent even if a caller passes a forecast that
+  // doesn't exactly match the current SHP2 snapshot (stale/synthetic inputs).
   const diurnalConfirmsDepletion =
-    forecast != null && forecast.minProjectedSoc != null && forecast.minProjectedSoc <= reserveForGate;
+    forecast != null &&
+    forecast.minProjectedSoc != null &&
+    forecast.minProjectedSoc <= (forecast.reserveSoc ?? reserveForGate);
   if (
     forecastCache &&
     forecastCache.depletionGate === diurnalConfirmsDepletion &&
