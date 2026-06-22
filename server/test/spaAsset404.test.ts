@@ -37,6 +37,10 @@ async function buildApp() {
   for (const d of [webDist, audioDir, audioRenderDir, chimesDir]) mkdirSync(d, { recursive: true });
   // A recognisable SPA shell so we can tell index.html apart from a 404 body.
   writeFileSync(join(webDist, 'index.html'), '<!doctype html><title>EcoFlow Panel SPA</title>');
+  // A REAL asset under each prefix, to prove the hard-404 fix does NOT break
+  // serving existing files. The /audio/ static is wildcard:false (enumerates at
+  // registration), so these must exist before the static plugins register below.
+  for (const d of [audioDir, audioRenderDir, chimesDir]) writeFileSync(join(d, 'existing.wav'), 'RIFFEXISTINGWAVDATA');
 
   const app = Fastify({ logger: false });
   await app.register(fastifyStatic, { root: webDist, wildcard: false });
@@ -93,6 +97,20 @@ test('a deep SPA route still serves index.html (404 scope not over-broadened)', 
     const r = await app.inject({ method: 'GET', url: '/alerts/some/deep/route' });
     assert.equal(r.statusCode, 200, `expected SPA fallback 200, got ${r.statusCode}`);
     assert.ok(/EcoFlow Panel SPA/.test(r.body), 'SPA deep-link fallback no longer serves index.html');
+  } finally {
+    await app.close();
+  }
+});
+
+test('existing assets under all three audio prefixes still serve 200 (fix did not over-broaden the 404)', async () => {
+  const app = await buildApp();
+  try {
+    for (const url of ['/audio/existing.wav', '/audio-render/existing.wav', '/chimes/existing.wav']) {
+      const r = await app.inject({ method: 'GET', url });
+      assert.equal(r.statusCode, 200, `expected a real asset at ${url} to serve 200, got ${r.statusCode}`);
+      assert.ok(/RIFFEXISTINGWAVDATA/.test(r.body), `${url} did not return the real asset bytes`);
+      assert.ok(!/EcoFlow Panel SPA/.test(r.body), `${url} returned the SPA index.html instead of the asset`);
+    }
   } finally {
     await app.close();
   }
