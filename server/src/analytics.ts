@@ -1087,17 +1087,14 @@ export async function getDayForecast(
   let pvSum = 0;
   let pvCeilingW = 0; // v0.14.1 — clear-sky array ceiling (max observedMaxPvW × 1.05)
 
-  // v0.9.3 — lift predicted EV-charging sessions into the load curve. The
-  // EVSE window-prediction pattern detector already runs separately; this
-  // just folds its upcoming-24h forecast into each hour the session covers.
-  // Build a per-hour-epoch map of predicted EV watts (constant across each
-  // session's `durationHours` from the session start). When two predicted
-  // sessions overlap (rare but possible if multiple EVs / circuits), they
-  // sum.
+  // v0.9.3 — lift predicted EV-charging sessions into the load curve. The EVSE
+  // window-prediction pattern detector runs separately; this folds its upcoming-24h
+  // forecast into each hour a session covers.
+  // v0.55.0 — single EVSE ⇒ overlapping predicted sessions are ALTERNATIVES (which recurring
+  // window will fire), not two cars at once, so evLoadByHour takes the MAX watts per covered
+  // hour (capped at the charger max), NOT the SUM. The old SUM stacked long overlapping windows
+  // into a physically-impossible ~17 kW, projecting a false overnight depletion to 0%.
   const evPredictions = computeEvWindowPrediction(devices, recorder);
-  // v0.55.0 — single EVSE ⇒ overlapping predicted sessions are alternatives, so take the MAX
-  // watts per covered hour (capped at the charger max), not the SUM (which stacked to ~17 kW
-  // and projected a false overnight depletion). See evLoadByHour.
   const evByHourEpoch = evLoadByHour(evPredictions.upcomingNext24h);
 
   for (let k = 0; k < 24; k++) {
@@ -2954,8 +2951,9 @@ export function computeEvWindowPrediction(
   }
 
   // Project forward 24 h. v0.13.3 — two projection rules, deduped per future
-  // hour so a given hour is lifted at most once (the consumer SUMS watts across
-  // overlapping sessions, so a double-emit would double the EV load):
+  // hour so a given start-hour is emitted at most once (v0.55.0: the consumer
+  // takes the MAX watts per covered hour, not the SUM — so a duplicate emit
+  // would no longer double the load, but de-duping here keeps the output clean):
   //   • Weekday-keyed patterns keep their original semantics — they fire only on
   //     the matching (dayOfWeek, hour). A Tuesday-only charger still lifts only
   //     Tuesdays.
