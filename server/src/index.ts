@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { config } from './config.js';
-import { createAuth } from './auth.js';
+import { createAuth, isAllowedOrigin } from './auth.js';
 import { SnapshotStore, startPollLoop } from './snapshot.js';
 import type { FleetSnapshot } from './snapshot.js';
 import { shp2ConnectedDpuSns, isShp2Connected, isSourceDpuStale, aggregateFleetFlow, findShp2, onlineDpus } from './shp2Membership.js';
@@ -247,6 +247,11 @@ await app.register(websocket, {
       threshold: 1024,
       zlibDeflateOptions: { level: 6 },
     },
+    // v0.68.0 — bound inbound ws frames. The /ws snapshot socket and the
+    // /console/ws terminal only ever receive tiny client frames (keystrokes,
+    // a small resize JSON; /ws receives nothing), so 64 KiB is generous while
+    // capping a malicious/runaway client's per-frame memory.
+    maxPayload: 64 * 1024,
   },
 });
 // v0.9.14 — gzip/brotli on every response over 1 kB. JSON payloads (snapshot,
@@ -1651,7 +1656,22 @@ function snapshotFrame(): string {
   }
   return wsFrameStr;
 }
-app.get('/ws', { websocket: true }, (socket) => {
+app.get('/ws', {
+  websocket: true,
+  // v0.68.0 — reject cross-origin upgrades on the snapshot socket too, matching
+  // the /console/ws policy and the CORS origin callback. Read-only telemetry,
+  // but a cross-origin page shouldn't be able to stream the fleet snapshot.
+  // Missing Origin (same-origin fetch / HA dashboards / curl) and LAN/same
+  // origins still pass, so the React dashboard and Lovelace cards are unaffected.
+  preValidation: (req, reply, done) => {
+    const origin = req.headers.origin?.toString();
+    if (origin && !isAllowedOrigin(origin, auth.sameOrigins)) {
+      reply.code(403).send({ error: 'forbidden-origin' });
+      return; // reply short-circuits the route → upgrade never happens
+    }
+    done();
+  },
+}, (socket) => {
   socket.send(snapshotFrame());
   const onChange = () => {
     if (socket.readyState === socket.OPEN) {
@@ -1731,7 +1751,15 @@ const stopTuiData = (() => {
     const tuiData = createTuiDataProvider({ store, recorder, log: (m) => app.log.info(m) });
     // Browser web terminal — always available on the web port (independent of
     // the telnet TCP toggle). Registered before app.listen().
-    registerWsConsole({ app, data: tuiData.provider, log: (m) => app.log.info(m) });
+    registerWsConsole({
+      app,
+      data: tuiData.provider,
+      log: (m) => app.log.info(m),
+      // Reject cross-origin ws upgrades using the SAME same-origin/LAN policy as
+      // CORS (auth.ts isAllowedOrigin). Missing Origin (same-origin browser
+      // fetch, HA panel_iframe, curl) is allowed by the caller in wsConsole.ts.
+      isOriginAllowed: (origin) => (origin ? isAllowedOrigin(origin, auth.sameOrigins) : true),
+    });
     app.log.info('console: web terminal available at /console');
     if (config.telnet.enabled) {
       stopTelnet = startTelnetServer({

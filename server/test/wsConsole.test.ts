@@ -11,7 +11,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseXtermData } from '../src/telnet/wsConsole.js';
+import Fastify from 'fastify';
+import websocket from '@fastify/websocket';
+import WebSocket from 'ws';
+import { parseXtermData, registerWsConsole, MAX_WS_SESSIONS, WS_IDLE_TIMEOUT_MS } from '../src/telnet/wsConsole.js';
 import { TuiSession } from '../src/telnet/session.js';
 import type { TuiDataProvider } from '../src/telnet/session.js';
 import type { FleetSnapshot } from '../src/snapshot.js';
@@ -172,4 +175,136 @@ test('TuiSession — TAB from a console returns to the chooser', () => {
   const r = session.feed([{ type: 'key', key: 'tab' }]); // back to chooser
   assert.equal(r.redraw, true);
   assert.equal(session.isInteractive, false);
+});
+
+/* ── /console/ws hardening (v0.68.0): origin gate, cap, idle timeout ─────── */
+
+/** Boot a real Fastify app with @fastify/websocket + the /console/ws route. */
+async function bootConsoleApp(opts: {
+  isOriginAllowed?: (o: string | undefined) => boolean;
+  maxSessions?: number;
+  idleTimeoutMs?: number;
+} = {}) {
+  const app = Fastify({ logger: false });
+  await app.register(websocket);
+  registerWsConsole({
+    app,
+    data: mockDataProvider(),
+    log: () => {},
+    isOriginAllowed: opts.isOriginAllowed,
+    maxSessions: opts.maxSessions,
+    idleTimeoutMs: opts.idleTimeoutMs,
+  });
+  await app.listen({ host: '127.0.0.1', port: 0 });
+  const addr = app.server.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  return { app, url: `ws://127.0.0.1:${port}/console/ws` };
+}
+
+/** Open a ws client and resolve once it's OPEN (or reject on close/error). */
+function openWs(url: string, headers?: Record<string, string>): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { headers });
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+    // A handshake rejection (HTTP 403) surfaces as 'unexpected-response'/'error'.
+  });
+}
+
+/** Wait for a ws to close, resolving with the close code. */
+function waitClose(ws: WebSocket): Promise<number> {
+  return new Promise((resolve) => ws.once('close', (code: number) => resolve(code)));
+}
+
+test('console/ws — cross-origin upgrade is rejected (403), same/missing Origin allowed', async () => {
+  const { app, url } = await bootConsoleApp({
+    // Mirror the production policy shape: allow only an explicit good origin.
+    isOriginAllowed: (o) => o === 'http://homeassistant.local:8787',
+  });
+  try {
+    // 1. A present, disallowed Origin → handshake fails (no 'open').
+    await assert.rejects(
+      openWs(url, { Origin: 'http://evil.example.com' }),
+      'cross-origin upgrade should be rejected before open',
+    );
+    // 2. An allowed Origin → connects.
+    const good = await openWs(url, { Origin: 'http://homeassistant.local:8787' });
+    assert.equal(good.readyState, WebSocket.OPEN);
+    good.close();
+    // 3. No Origin at all (curl / same-origin / panel_iframe) → connects.
+    const none = await openWs(url);
+    assert.equal(none.readyState, WebSocket.OPEN);
+    none.close();
+  } finally {
+    await app.close();
+  }
+});
+
+test('console/ws — concurrency cap: session beyond the limit is closed 1013', async () => {
+  const { app, url } = await bootConsoleApp({ maxSessions: 2 });
+  try {
+    const a = await openWs(url);
+    const b = await openWs(url);
+    // The 3rd is admitted then immediately closed with 1013 (Try Again Later).
+    const c = await openWs(url);
+    const code = await waitClose(c);
+    assert.equal(code, 1013, 'over-cap session should close with 1013');
+    // The first two stay open.
+    assert.equal(a.readyState, WebSocket.OPEN);
+    assert.equal(b.readyState, WebSocket.OPEN);
+    a.close();
+    b.close();
+  } finally {
+    await app.close();
+  }
+});
+
+test('console/ws — cap decrements on close, freeing a slot for a new session', async () => {
+  const { app, url } = await bootConsoleApp({ maxSessions: 1 });
+  try {
+    const a = await openWs(url);
+    // 2nd over the cap → closed 1013.
+    const b = await openWs(url);
+    assert.equal(await waitClose(b), 1013);
+    // Close the live one and wait for the server to observe it.
+    a.close();
+    await waitClose(a);
+    // Give the server's 'close' handler a tick to decrement liveSessions.
+    await new Promise((r) => setTimeout(r, 50));
+    // A fresh session now fits.
+    const c = await openWs(url);
+    assert.equal(c.readyState, WebSocket.OPEN);
+    c.close();
+  } finally {
+    await app.close();
+  }
+});
+
+test('console/ws — idle session is closed after the idle timeout; input resets it', async () => {
+  // 150 ms idle window keeps the test fast.
+  const { app, url } = await bootConsoleApp({ idleTimeoutMs: 150 });
+  try {
+    const idle = await openWs(url);
+    const t0 = Date.now();
+    const code = await waitClose(idle);
+    assert.ok(Date.now() - t0 >= 140, 'should not close before the idle window');
+    assert.ok(code === 1000 || code === 1005 || code === 1006, `unexpected idle close code ${code}`);
+
+    // A session that keeps sending input is NOT closed within the window.
+    const active = await openWs(url);
+    let closed = false;
+    active.once('close', () => { closed = true; });
+    const beat = setInterval(() => active.send('x'), 50); // input every 50 ms < 150 ms
+    await new Promise((r) => setTimeout(r, 400)); // >2 idle windows
+    clearInterval(beat);
+    assert.equal(closed, false, 'active session must survive past the idle window');
+    active.close();
+  } finally {
+    await app.close();
+  }
+});
+
+test('console/ws — exported guard-rail constants are sane', () => {
+  assert.ok(MAX_WS_SESSIONS >= 1 && MAX_WS_SESSIONS <= 256);
+  assert.ok(WS_IDLE_TIMEOUT_MS >= 60_000, 'idle window should be at least a minute in prod');
 });

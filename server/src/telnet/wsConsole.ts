@@ -19,19 +19,53 @@
  * Auth posture: the telnet TUI is already unauthenticated on the LAN, so this
  * read-only browser view is the SAME exposure. It does NOT touch the existing
  * write-auth and does NOT add auth that would break `panel_iframe`.
+ *
+ * v0.68.0 hardening — the /console/ws upgrade is still unauthenticated but no
+ * longer unbounded: a cross-origin Origin is rejected (same-origin/LAN/missing
+ * Origin still pass, so the HA panel_iframe is unaffected), concurrent sessions
+ * are capped, idle sessions time out, and inbound frames are size-bounded by
+ * the @fastify/websocket `maxPayload`.
  */
 
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import { TuiSession } from './session.js';
 import type { InputEvent, TuiDataProvider } from './session.js';
+
+/**
+ * v0.68.0 — guard rails for the (unauthenticated) /console/ws transport:
+ *   • MAX_WS_SESSIONS    — concurrent-session cap; beyond it the upgrade is
+ *     accepted then immediately closed 1013 (Try Again Later) so a runaway
+ *     client (or open tab storm) can't pin unbounded 1 Hz render loops.
+ *   • WS_IDLE_TIMEOUT_MS — close a session that has received no inbound ws
+ *     message for this long, so an idle/forgotten browser tab stops holding a
+ *     live render loop forever. Reset on every inbound frame.
+ * Both are deliberately generous — this is a LAN operator view, not a public
+ * endpoint — but turn an unbounded surface into a bounded one.
+ */
+export const MAX_WS_SESSIONS = 16;
+export const WS_IDLE_TIMEOUT_MS = 5 * 60_000;
+/** WebSocket close code 1013 = "Try Again Later" (RFC 6455 §7.4.1). */
+const WS_TRY_AGAIN_LATER = 1013;
 
 export interface WsConsoleOptions {
   app: FastifyInstance;
   data: TuiDataProvider;
   log: (msg: string) => void;
+  /**
+   * Origin allow-list check for the ws upgrade. Should mirror the panel's
+   * existing same-origin/LAN policy (auth.ts `isAllowedOrigin`). A missing
+   * Origin (same-origin browser fetch, HA panel_iframe, curl) is treated as
+   * allowed — the policy only rejects a *present, cross-origin* Origin.
+   * Omitted in tests that don't exercise the upgrade path.
+   */
+  isOriginAllowed?: (origin: string | undefined) => boolean;
+  /** Concurrent-session cap override (defaults to MAX_WS_SESSIONS). Test seam. */
+  maxSessions?: number;
+  /** Idle-timeout override in ms (defaults to WS_IDLE_TIMEOUT_MS). Test seam. */
+  idleTimeoutMs?: number;
 }
 
 /**
@@ -194,6 +228,10 @@ const CONSOLE_HTML = `<!doctype html>
 
   var ws = null;
   var retry = null;
+  // Last cols/rows we actually sent. term.resize() re-triggers term.onResize
+  // (→ sendResize), so without this guard each user resize sent a duplicate
+  // {type:'resize'} frame and could re-enter. Track + compare to suppress that.
+  var lastCols = 0, lastRows = 0;
 
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -203,7 +241,10 @@ const CONSOLE_HTML = `<!doctype html>
     ws = new WebSocket(url);
 
     ws.onopen = function () {
+      if (retry) { clearTimeout(retry); retry = null; }
       statusEl.textContent = 'connected';
+      // Force the first resize through even if dims() matches the stale latch.
+      lastCols = 0; lastRows = 0;
       sendResize();
     };
     ws.onmessage = function (ev) { term.write(ev.data); };
@@ -214,10 +255,15 @@ const CONSOLE_HTML = `<!doctype html>
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+  var inResize = false;
   function sendResize() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (inResize) return; // term.resize() below re-enters via onResize — ignore
     var d = dims();
-    term.resize(d.cols, d.rows);
+    if (d.cols === lastCols && d.rows === lastRows) return; // no actual change
+    lastCols = d.cols; lastRows = d.rows;
+    inResize = true;
+    try { term.resize(d.cols, d.rows); } finally { inResize = false; }
     ws.send(JSON.stringify({ type: 'resize', cols: d.cols, rows: d.rows }));
   }
 
@@ -243,11 +289,17 @@ const CONSOLE_HTML = `<!doctype html>
  * call once after `@fastify/websocket` is registered.
  */
 export function registerWsConsole(opts: WsConsoleOptions): void {
-  const { app, data, log } = opts;
+  const { app, data, log, isOriginAllowed } = opts;
+  const maxSessions = opts.maxSessions ?? MAX_WS_SESSIONS;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? WS_IDLE_TIMEOUT_MS;
 
   if (!XTERM_JS || !XTERM_CSS) {
     log('console: WARNING — @xterm/xterm dist not found in node_modules; /console assets will 404');
   }
+
+  // Live /console/ws session count for the concurrency cap. Incremented when a
+  // session is admitted, decremented exactly once on close.
+  let liveSessions = 0;
 
   app.get('/console', (_req, reply) => {
     reply.header('Content-Type', 'text/html; charset=utf-8').send(CONSOLE_HTML);
@@ -269,7 +321,34 @@ export function registerWsConsole(opts: WsConsoleOptions): void {
       .send(XTERM_CSS);
   });
 
-  app.get('/console/ws', { websocket: true }, (socket: WebSocket) => {
+  app.get('/console/ws', {
+    websocket: true,
+    // Reject cross-origin upgrades BEFORE the socket is hijacked. Replying from
+    // a preValidation hook short-circuits the route, so the upgrade never
+    // happens. A missing Origin (same-origin fetch, HA panel_iframe, curl) is
+    // allowed — only a present, disallowed Origin is rejected. No-op when
+    // isOriginAllowed is not supplied.
+    preValidation: (req: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => {
+      if (isOriginAllowed) {
+        const origin = req.headers.origin?.toString();
+        if (origin && !isOriginAllowed(origin)) {
+          reply.code(403).send({ error: 'forbidden-origin' });
+          return; // do NOT call done() — reply short-circuits the route
+        }
+      }
+      done();
+    },
+  }, (socket: WebSocket) => {
+    // Concurrency cap: admit-then-close-1013 beyond the limit. We accept the
+    // upgrade first (the cap fires post-handshake) and immediately close with
+    // "Try Again Later" so the browser sees a clean, well-coded rejection.
+    if (liveSessions >= maxSessions) {
+      log(`console: ws session cap (${maxSessions}) reached — rejecting with 1013`);
+      try { socket.close(WS_TRY_AGAIN_LATER, 'too many sessions'); } catch { /* ignore */ }
+      return;
+    }
+    liveSessions += 1;
+
     const session = new TuiSession({
       // xterm renders the bytes verbatim; no telnet alt-buffer dance needed.
       write: (payload) => {
@@ -284,15 +363,31 @@ export function registerWsConsole(opts: WsConsoleOptions): void {
     // ~1 s of changing.
     const timer = setInterval(() => { if (alive) session.draw(); }, 1000);
 
+    // Idle timeout — close a session with no inbound traffic for
+    // WS_IDLE_TIMEOUT_MS so a forgotten tab stops holding the render loop.
+    // Reset on every inbound ws message.
+    let idleTimer: NodeJS.Timeout;
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        log('console: ws session idle timeout — closing');
+        try { socket.close(); } catch { /* ignore */ }
+      }, idleTimeoutMs);
+    };
+
     const cleanup = () => {
       if (!alive) return;
       alive = false;
       clearInterval(timer);
+      clearTimeout(idleTimer);
+      liveSessions -= 1;
     };
 
+    armIdle();
     session.draw();
 
     socket.on('message', (raw: Buffer) => {
+      armIdle(); // any inbound frame resets the idle deadline
       const text = raw.toString('utf8');
       // A control message is a JSON object with a known `type`; anything else
       // is treated as raw keyboard data from xterm.
