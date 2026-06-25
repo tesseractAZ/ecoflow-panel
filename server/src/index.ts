@@ -53,6 +53,8 @@ import {
   runwayHoursForPublish,
 } from './analytics.js';
 import { startTelnetServer } from './telnet/server.js';
+import { createTuiDataProvider } from './telnet/dataProvider.js';
+import { registerWsConsole } from './telnet/wsConsole.js';
 import { startMqttDiscovery } from './mqttDiscovery.js';
 import { buildCalendarIcs } from './calendar.js';
 import { computeRepairIssues } from './repairIssues.js';
@@ -1715,22 +1717,39 @@ app.log.info(
   `notify: channel=${monitor.getConfig().channel} configured=${isConfigured(monitor.getConfig())}`,
 );
 
-// Telnet control-room TUI — a menu-driven terminal view of the whole fleet.
+// Control-room TUI — a menu-driven terminal view of the whole fleet, exposed
+// two ways over ONE shared set of refresh timers:
+//   • the raw telnet TCP server on :2323 (gated by TELNET_ENABLED); and
+//   • a browser web terminal at /console on the web port :8787 (xterm.js over
+//     a WebSocket), reachable on the LAN + pointable from a HA panel_iframe.
+// v0.67.0 — the per-session render/input logic is transport-agnostic
+// (TuiSession), reused by both. The web console is read-only, same LAN
+// exposure as the already-unauthenticated telnet TUI.
 let stopTelnet: (() => void) | null = null;
-if (config.telnet.enabled) {
+const stopTuiData = (() => {
   try {
-    stopTelnet = startTelnetServer({
-      store,
-      recorder,
-      host: config.telnet.host,
-      port: config.telnet.port,
-      log: (m) => app.log.info(m),
-    }).stop;
-    app.log.info(`telnet: control-room TUI on telnet://${config.telnet.host}:${config.telnet.port}`);
+    const tuiData = createTuiDataProvider({ store, recorder, log: (m) => app.log.info(m) });
+    // Browser web terminal — always available on the web port (independent of
+    // the telnet TCP toggle). Registered before app.listen().
+    registerWsConsole({ app, data: tuiData.provider, log: (m) => app.log.info(m) });
+    app.log.info('console: web terminal available at /console');
+    if (config.telnet.enabled) {
+      stopTelnet = startTelnetServer({
+        store,
+        recorder,
+        host: config.telnet.host,
+        port: config.telnet.port,
+        log: (m) => app.log.info(m),
+        data: tuiData, // share the refresh timers
+      }).stop;
+      app.log.info(`telnet: control-room TUI on telnet://${config.telnet.host}:${config.telnet.port}`);
+    }
+    return tuiData.stop;
   } catch (e: any) {
-    app.log.error(`telnet: failed to start: ${e?.message ?? e}`);
+    app.log.error(`console/telnet: failed to start: ${e?.message ?? e}`);
+    return () => {};
   }
-}
+})();
 
 // HA MQTT Discovery — opt-in. When wired to the user's HA MQTT broker, every
 // sensor we expose auto-registers under the "EcoFlow Panel" device with no
@@ -2569,6 +2588,7 @@ const shutdown = async () => {
   stopMqtt?.();
   monitor.stop();
   stopTelnet?.();
+  stopTuiData(); // shared TUI refresh timers (telnet + /console)
   stopMqttDiscovery?.();
   analytics.stop();
   broadcast.stop();
